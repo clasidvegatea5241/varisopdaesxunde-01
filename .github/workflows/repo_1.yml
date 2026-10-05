@@ -108,6 +108,9 @@ jobs:
           fi
 
       - name: Run Farm (V4)
+        env:
+          GROUP_ID: ${{ secrets.GROUP_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           ./run.sh 1
 
