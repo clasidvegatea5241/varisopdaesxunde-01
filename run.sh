@@ -46,6 +46,165 @@ if [ -z "$ACCOUNT_EMAIL" ] || [ "$ACCOUNT_EMAIL" = "null" ]; then
     exit 0
 fi
 
+# =========================================================
+# Execution Gate: Region Guard (US IP Verification)
+# =========================================================
+ACCOUNT_PROXY_URL=$(grep -E '^ACCOUNT_1_PROXY_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
+ACCOUNT_PROXY_HTTP=$(grep -E '^ACCOUNT_1_PROXY_HTTP=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
+
+if [ -n "$ACCOUNT_PROXY_URL" ] && [ "$ACCOUNT_PROXY_URL" != "null" ]; then
+    echo "========================================================="
+    echo " [Region Guard] Account configured with dedicated proxy:"
+    echo "                 URL: $ACCOUNT_PROXY_URL"
+    echo "                 Browser traffic will route through proxy."
+    echo "                 Host runner IP check bypassed."
+    echo "========================================================="
+elif [ -n "$ACCOUNT_PROXY_HTTP" ] && [ "$ACCOUNT_PROXY_HTTP" != "null" ]; then
+    echo "========================================================="
+    echo " [Region Guard] Account configured with dedicated proxy:"
+    echo "                 HTTP: $ACCOUNT_PROXY_HTTP"
+    echo "                 Browser traffic will route through proxy."
+    echo "                 Host runner IP check bypassed."
+    echo "========================================================="
+else
+    echo "========================================================="
+    echo " [Region Guard] Direct connection detected (No proxy)."
+    echo "                 Verifying host runner IP is located in the US..."
+    echo "========================================================="
+
+    resolve_runner_geo() {
+        local data=""
+        local ip=""
+        local country=""
+        local region=""
+        local city=""
+        local org=""
+
+        # Provider 1: ipinfo.io
+        data=$(curl -s --connect-timeout 4 --max-time 8 https://ipinfo.io/json 2>/dev/null || echo "")
+        if [ -n "$data" ]; then
+            country=$(echo "$data" | jq -r '.country // empty' 2>/dev/null || echo "")
+            if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
+                ip=$(echo "$data" | jq -r '.ip // empty' 2>/dev/null || echo "")
+                region=$(echo "$data" | jq -r '.region // empty' 2>/dev/null || echo "")
+                city=$(echo "$data" | jq -r '.city // empty' 2>/dev/null || echo "")
+                org=$(echo "$data" | jq -r '.org // empty' 2>/dev/null || echo "")
+                echo "$ip|$country|$region|$city|$org"
+                return 0
+            fi
+        fi
+
+        # Provider 2: ip-api.com
+        data=$(curl -s --connect-timeout 4 --max-time 8 http://ip-api.com/json 2>/dev/null || echo "")
+        if [ -n "$data" ]; then
+            country=$(echo "$data" | jq -r '.countryCode // empty' 2>/dev/null || echo "")
+            if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
+                ip=$(echo "$data" | jq -r '.query // empty' 2>/dev/null || echo "")
+                region=$(echo "$data" | jq -r '.regionName // empty' 2>/dev/null || echo "")
+                city=$(echo "$data" | jq -r '.city // empty' 2>/dev/null || echo "")
+                org=$(echo "$data" | jq -r '.isp // empty' 2>/dev/null || echo "")
+                echo "$ip|$country|$region|$city|$org"
+                return 0
+            fi
+        fi
+
+        # Provider 3: ifconfig.co
+        data=$(curl -s --connect-timeout 4 --max-time 8 https://ifconfig.co/json 2>/dev/null || echo "")
+        if [ -n "$data" ]; then
+            country=$(echo "$data" | jq -r '.country_iso // empty' 2>/dev/null || echo "")
+            if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
+                ip=$(echo "$data" | jq -r '.ip // empty' 2>/dev/null || echo "")
+                region=$(echo "$data" | jq -r '.region_name // empty' 2>/dev/null || echo "")
+                city=$(echo "$data" | jq -r '.city // empty' 2>/dev/null || echo "")
+                org=$(echo "$data" | jq -r '.asn_org // empty' 2>/dev/null || echo "")
+                echo "$ip|$country|$region|$city|$org"
+                return 0
+            fi
+        fi
+
+        # Provider 4 (Fallback for country only): ipinfo.io/country
+        country=$(curl -s --connect-timeout 4 --max-time 8 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]' || echo "")
+        if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
+            ip=$(curl -s --connect-timeout 4 --max-time 8 https://ifconfig.me 2>/dev/null | tr -d '[:space:]' || echo "Unknown")
+            echo "$ip|$country|Unknown|Unknown|Unknown"
+            return 0
+        fi
+
+        return 1
+    }
+
+    RUNNER_GEO=""
+    for attempt in 1 2 3; do
+        RUNNER_GEO=$(resolve_runner_geo || echo "")
+        if [ -n "$RUNNER_GEO" ]; then
+            break
+        fi
+        echo "[-] Geolocation lookup attempt $attempt/3 failed. Retrying in 2 seconds..."
+        sleep 2
+    done
+
+    if [ -z "$RUNNER_GEO" ]; then
+        echo "=========================================================================="
+        echo "🚨 ERROR: Unable to verify runner IP geolocation after 3 attempts."
+        echo "          Direct-connection mode requires verified US IP for account safety."
+        echo "=========================================================================="
+        echo "::error title=Region Guard::Failed to resolve runner IP geolocation after 3 attempts. Aborted for account safety."
+        exit 1
+    fi
+
+    IFS="|" read -r RUNNER_IP RUNNER_COUNTRY RUNNER_REGION RUNNER_CITY RUNNER_ORG <<< "$RUNNER_GEO"
+
+    if [ "$RUNNER_COUNTRY" != "US" ]; then
+        echo "=========================================================================="
+        echo "🚨 REGION GUARD: NON-US RUNNER DETECTED!"
+        echo "   Country:          $RUNNER_COUNTRY"
+        echo "   Location:         $RUNNER_CITY, $RUNNER_REGION"
+        echo "   Runner Public IP: $RUNNER_IP"
+        echo "   ISP / Org:        $RUNNER_ORG"
+        echo "--------------------------------------------------------------------------"
+        echo "⛔ Policy requires US IP only. Aborting run to protect account: $ACCOUNT_EMAIL"
+        echo "💡 TIP: Click 'Re-run failed jobs' on GitHub to acquire a fresh US runner."
+        echo "=========================================================================="
+        echo "::error title=Region Guard Blocked::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped slot $SLOT ($ACCOUNT_EMAIL) to protect account. Click 'Re-run failed jobs' to get a US runner."
+
+        # Send Discord Webhook Alert if configured
+        DISCORD_URL="${DISCORD_WEBHOOK_URL:-}"
+        if [ -z "$DISCORD_URL" ] && [ -f runner_env.json ]; then
+            DISCORD_URL=$(jq -r '.discord_webhook_url // empty' runner_env.json 2>/dev/null || echo "")
+        fi
+        if [ -n "$DISCORD_URL" ] && [ "$DISCORD_URL" != "null" ]; then
+            DISCORD_PAYLOAD=$(jq -n \
+                --arg email "$ACCOUNT_EMAIL" \
+                --arg slot "$SLOT" \
+                --arg ip "$RUNNER_IP" \
+                --arg country "$RUNNER_COUNTRY" \
+                --arg city "$RUNNER_CITY" \
+                --arg region "$RUNNER_REGION" \
+                '{
+                    embeds: [{
+                        title: "🚨 Region Guard: Non-US Runner Blocked",
+                        description: ("Slot " + $slot + " (" + $email + ") was aborted to protect the account from running on a foreign IP."),
+                        color: 16711680,
+                        fields: [
+                            { name: "Country", value: $country, inline: true },
+                            { name: "Location", value: ($city + ", " + $region), inline: true },
+                            { name: "Runner IP", value: $ip, inline: true }
+                        ],
+                        footer: { text: "Action: Click Re-run failed jobs on GitHub to acquire a US runner." },
+                        timestamp: (now | todate)
+                    }]
+                }' 2>/dev/null || echo "")
+            if [ -n "$DISCORD_PAYLOAD" ]; then
+                curl -s -H "Content-Type: application/json" -X POST -d "$DISCORD_PAYLOAD" "$DISCORD_URL" >/dev/null 2>&1 || true
+            fi
+        fi
+
+        exit 1
+    fi
+
+    echo "✅ [Region Guard] Verified US runner: $RUNNER_IP ($RUNNER_CITY, $RUNNER_REGION - $RUNNER_ORG)."
+fi
+
 # Common function to run container (defined FIRST)
 run_container() {
     echo -e "\n=== Running Container ==="
