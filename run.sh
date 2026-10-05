@@ -50,19 +50,11 @@ fi
 # Execution Gate: Region Guard (US IP Verification)
 # =========================================================
 ACCOUNT_PROXY_URL=$(grep -E '^ACCOUNT_1_PROXY_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
-ACCOUNT_PROXY_HTTP=$(grep -E '^ACCOUNT_1_PROXY_HTTP=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
 
 if [ -n "$ACCOUNT_PROXY_URL" ] && [ "$ACCOUNT_PROXY_URL" != "null" ]; then
     echo "========================================================="
     echo " [Region Guard] Account configured with dedicated proxy:"
     echo "                 URL: $ACCOUNT_PROXY_URL"
-    echo "                 Browser traffic will route through proxy."
-    echo "                 Host runner IP check bypassed."
-    echo "========================================================="
-elif [ -n "$ACCOUNT_PROXY_HTTP" ] && [ "$ACCOUNT_PROXY_HTTP" != "null" ]; then
-    echo "========================================================="
-    echo " [Region Guard] Account configured with dedicated proxy:"
-    echo "                 HTTP: $ACCOUNT_PROXY_HTTP"
     echo "                 Browser traffic will route through proxy."
     echo "                 Host runner IP check bypassed."
     echo "========================================================="
