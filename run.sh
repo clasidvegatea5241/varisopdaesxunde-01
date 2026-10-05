@@ -155,8 +155,20 @@ else
     IFS="|" read -r RUNNER_IP RUNNER_COUNTRY RUNNER_REGION RUNNER_CITY RUNNER_ORG <<< "$RUNNER_GEO"
 
     if [ "$RUNNER_COUNTRY" != "US" ]; then
+        # Resolve Group Name/ID
+        GROUP_NAME="${GROUP_ID:-}"
+        if [ -z "$GROUP_NAME" ] && [ -f runner_env.json ]; then
+            GROUP_NAME=$(jq -r '.group_id // .group // empty' runner_env.json 2>/dev/null || echo "")
+        fi
+        if [ -z "$GROUP_NAME" ]; then
+            GROUP_NAME="Unknown"
+        fi
+
         echo "=========================================================================="
         echo "🚨 REGION GUARD: NON-US RUNNER DETECTED!"
+        echo "   Group:            $GROUP_NAME"
+        echo "   Slot:             Slot $SLOT"
+        echo "   Account:          $ACCOUNT_EMAIL"
         echo "   Country:          $RUNNER_COUNTRY"
         echo "   Location:         $RUNNER_CITY, $RUNNER_REGION"
         echo "   Runner Public IP: $RUNNER_IP"
@@ -165,15 +177,19 @@ else
         echo "⛔ Policy requires US IP only. Aborting run to protect account: $ACCOUNT_EMAIL"
         echo "💡 TIP: Click 'Re-run failed jobs' on GitHub to acquire a fresh US runner."
         echo "=========================================================================="
-        echo "::error title=Region Guard Blocked::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped slot $SLOT ($ACCOUNT_EMAIL) to protect account. Click 'Re-run failed jobs' to get a US runner."
+        echo "::error title=Region Guard Blocked::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL) to protect account. Click 'Re-run failed jobs' to get a US runner."
 
-        # Send Discord Webhook Alert if configured
+        # Send Discord Webhook Alert if configured (Supports Secrets, Matrix DB runner_env.json, and .env)
         DISCORD_URL="${DISCORD_WEBHOOK_URL:-}"
         if [ -z "$DISCORD_URL" ] && [ -f runner_env.json ]; then
             DISCORD_URL=$(jq -r '.discord_webhook_url // empty' runner_env.json 2>/dev/null || echo "")
         fi
+        if [ -z "$DISCORD_URL" ] && [ -f .env ]; then
+            DISCORD_URL=$(grep -E '^CONFIG_DISCORD_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
+        fi
         if [ -n "$DISCORD_URL" ] && [ "$DISCORD_URL" != "null" ]; then
             DISCORD_PAYLOAD=$(jq -n \
+                --arg group "$GROUP_NAME" \
                 --arg email "$ACCOUNT_EMAIL" \
                 --arg slot "$SLOT" \
                 --arg ip "$RUNNER_IP" \
@@ -183,12 +199,15 @@ else
                 '{
                     embeds: [{
                         title: "🚨 Region Guard: Non-US Runner Blocked",
-                        description: ("Slot " + $slot + " (" + $email + ") was aborted to protect the account from running on a foreign IP."),
+                        description: ("Group **" + $group + "** • Slot **" + $slot + "** (" + $email + ") was aborted to protect the account from running on a foreign IP."),
                         color: 16711680,
                         fields: [
+                            { name: "Group", value: $group, inline: true },
+                            { name: "Slot", value: ("Slot " + $slot), inline: true },
                             { name: "Country", value: $country, inline: true },
                             { name: "Location", value: ($city + ", " + $region), inline: true },
-                            { name: "Runner IP", value: $ip, inline: true }
+                            { name: "Runner IP", value: $ip, inline: true },
+                            { name: "Account", value: $email, inline: false }
                         ],
                         footer: { text: "Action: Click Re-run failed jobs on GitHub to acquire a US runner." },
                         timestamp: (now | todate)
