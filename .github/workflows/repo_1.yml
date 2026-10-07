@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: "30 9 * * *" # Starts with buffer, runs around Slot 1 (4:00 PM IST Target)
   workflow_dispatch:
+    inputs:
+      retry_attempt:
+        description: 'Auto retry attempt count'
+        required: false
+        default: '0'
 
 concurrency:
   group: daily-docker-1-${github.ref}
@@ -111,6 +116,9 @@ jobs:
         env:
           GROUP_ID: ${{ secrets.GROUP_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
+          WORKFLOW_FILE: "repo_1.yml"
         run: |
           ./run.sh 1
 
