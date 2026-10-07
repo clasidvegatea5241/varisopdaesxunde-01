@@ -156,6 +156,73 @@ else
             GROUP_NAME="Unknown"
         fi
 
+        # ------------------------------------------------------------------
+        # Autonomous Auto-Reroll & Human-like Delay Logic
+        # ------------------------------------------------------------------
+        RETRY_ATTEMPT="${RETRY_ATTEMPT:-0}"
+        if ! [[ "$RETRY_ATTEMPT" =~ ^[0-9]+$ ]]; then
+            RETRY_ATTEMPT=0
+        fi
+
+        PAT_TOKEN="${GH_PAT:-${AUTO_RERUN_TOKEN:-}}"
+        MAX_RETRIES=3
+        AUTO_REROLL_TRIGGERED=false
+        BUFFER_DELAY=0
+
+        # Determine target workflow file name
+        TARGET_WORKFLOW="${WORKFLOW_FILE:-}"
+        if [ -z "$TARGET_WORKFLOW" ] && [ -n "$GITHUB_WORKFLOW_REF" ]; then
+            TARGET_WORKFLOW=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+        fi
+
+        if [ -n "$PAT_TOKEN" ] && [ "$PAT_TOKEN" != "null" ] && [ "$RETRY_ATTEMPT" -lt "$MAX_RETRIES" ] && [ -n "$TARGET_WORKFLOW" ]; then
+            NEXT_ATTEMPT=$((RETRY_ATTEMPT + 1))
+            BUFFER_DELAY=$((60 + RANDOM % 61)) # 60 to 120 seconds
+
+            echo "=========================================================================="
+            echo "🔄 AUTONOMOUS AUTO-REROLL: Dispatching replacement runner..."
+            echo "   Target Workflow:  $TARGET_WORKFLOW"
+            echo "   Branch / Ref:     ${GITHUB_REF_NAME:-main}"
+            echo "   Attempt:          $NEXT_ATTEMPT of $MAX_RETRIES"
+            echo "   Human Buffer:     ${BUFFER_DELAY}s (Queued job starts after current job exits)"
+            echo "=========================================================================="
+
+            DISPATCH_SUCCESS=false
+
+            # Method 1: GitHub CLI (if gh binary is present)
+            if command -v gh >/dev/null 2>&1; then
+                if GH_TOKEN="$PAT_TOKEN" gh workflow run "$TARGET_WORKFLOW" \
+                    --ref "${GITHUB_REF_NAME:-main}" \
+                    -f retry_attempt="$NEXT_ATTEMPT" >/dev/null 2>&1; then
+                    DISPATCH_SUCCESS=true
+                fi
+            fi
+
+            # Method 2: Fallback to GitHub REST API via curl
+            if [ "$DISPATCH_SUCCESS" = "false" ] && [ -n "$GITHUB_REPOSITORY" ]; then
+                HTTP_RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                    -H "Authorization: Bearer $PAT_TOKEN" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${TARGET_WORKFLOW}/dispatches" \
+                    -d "{\"ref\":\"${GITHUB_REF_NAME:-main}\",\"inputs\":{\"retry_attempt\":\"${NEXT_ATTEMPT}\"}}" 2>/dev/null || echo "000")
+                if [ "$HTTP_RESP" = "204" ] || [ "$HTTP_RESP" = "200" ] || [ "$HTTP_RESP" = "201" ]; then
+                    DISPATCH_SUCCESS=true
+                fi
+            fi
+
+            if [ "$DISPATCH_SUCCESS" = "true" ]; then
+                AUTO_REROLL_TRIGGERED=true
+                echo "✅ Replacement run successfully queued in GitHub Actions!"
+            else
+                echo "⚠️ Failed to dispatch replacement run via API. Proceeding with standard exit."
+            fi
+        elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
+            echo "=========================================================================="
+            echo "⛔ MAX AUTO-RETRIES REACHED ($RETRY_ATTEMPT/$MAX_RETRIES)!"
+            echo "   Foreign IP persisted across multiple attempts. Manual check required."
+            echo "=========================================================================="
+        fi
+
         echo "=========================================================================="
         echo "🚨 REGION GUARD: NON-US RUNNER DETECTED!"
         echo "   Group:            $GROUP_NAME"
@@ -165,11 +232,25 @@ else
         echo "   Location:         $RUNNER_CITY, $RUNNER_REGION"
         echo "   Runner Public IP: $RUNNER_IP"
         echo "   ISP / Org:        $RUNNER_ORG"
+        if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+            echo "   Auto-Reroll:      Queued (Attempt $NEXT_ATTEMPT/$MAX_RETRIES, buffer: ${BUFFER_DELAY}s)"
+        fi
         echo "--------------------------------------------------------------------------"
         echo "⛔ Policy requires US IP only. Aborting run to protect account: $ACCOUNT_EMAIL"
-        echo "💡 TIP: Click 'Re-run failed jobs' on GitHub to acquire a fresh US runner."
+        if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+            echo "💡 Replacement run is queued and will execute automatically after cooldown."
+        else
+            echo "💡 TIP: Click 'Re-run failed jobs' on GitHub to acquire a fresh US runner."
+        fi
         echo "=========================================================================="
-        echo "::error title=Region Guard Blocked::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL) to protect account. Click 'Re-run failed jobs' to get a US runner."
+
+        if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+            echo "::error title=Region Guard Blocked (Auto-Reroll Queued)::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Queued replacement run will launch in ~${BUFFER_DELAY}s (Attempt $NEXT_ATTEMPT/$MAX_RETRIES)."
+        elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
+            echo "::error title=Region Guard Blocked (Max Retries Reached)::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Max auto-retries reached ($RETRY_ATTEMPT/$MAX_RETRIES)."
+        else
+            echo "::error title=Region Guard Blocked::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL) to protect account. Click 'Re-run failed jobs' to get a US runner."
+        fi
 
         # Send Discord Webhook Alert if configured (Supports Secrets, Matrix DB runner_env.json, and .env)
         DISCORD_URL="${DISCORD_WEBHOOK_URL:-}"
@@ -180,6 +261,17 @@ else
             DISCORD_URL=$(grep -E '^CONFIG_DISCORD_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
         fi
         if [ -n "$DISCORD_URL" ] && [ "$DISCORD_URL" != "null" ]; then
+            if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was aborted due to foreign IP.\n🔄 **Auto-Reroll Queued!** Fresh runner will start after ~${BUFFER_DELAY}s buffer (Attempt **${NEXT_ATTEMPT}** of ${MAX_RETRIES})."
+                DISCORD_FOOTER="Autonomous Auto-Reroll Active • Queued run executes on fresh VM."
+            elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
+                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was aborted due to foreign IP.\n⛔ **Max Retries Reached (${RETRY_ATTEMPT}/${MAX_RETRIES})!** Foreign IP persisted."
+                DISCORD_FOOTER="Action: Azure may be experiencing regional congestion. Manual check required."
+            else
+                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was aborted to protect the account from running on a foreign IP."
+                DISCORD_FOOTER="Action: Click Re-run failed jobs on GitHub to acquire a US runner."
+            fi
+
             DISCORD_PAYLOAD=$(jq -n \
                 --arg group "$GROUP_NAME" \
                 --arg email "$ACCOUNT_EMAIL" \
@@ -188,10 +280,12 @@ else
                 --arg country "$RUNNER_COUNTRY" \
                 --arg city "$RUNNER_CITY" \
                 --arg region "$RUNNER_REGION" \
+                --arg desc "$DISCORD_DESC" \
+                --arg footer "$DISCORD_FOOTER" \
                 '{
                     embeds: [{
                         title: "🚨 Region Guard: Non-US Runner Blocked",
-                        description: ("Group **" + $group + "** • Slot **" + $slot + "** (" + $email + ") was aborted to protect the account from running on a foreign IP."),
+                        description: $desc,
                         color: 16711680,
                         fields: [
                             { name: "Group", value: $group, inline: true },
@@ -201,13 +295,19 @@ else
                             { name: "Runner IP", value: $ip, inline: true },
                             { name: "Account", value: $email, inline: false }
                         ],
-                        footer: { text: "Action: Click Re-run failed jobs on GitHub to acquire a US runner." },
+                        footer: { text: $footer },
                         timestamp: (now | todate)
                     }]
                 }' 2>/dev/null || echo "")
             if [ -n "$DISCORD_PAYLOAD" ]; then
                 curl -s -H "Content-Type: application/json" -X POST -d "$DISCORD_PAYLOAD" "$DISCORD_URL" >/dev/null 2>&1 || true
             fi
+        fi
+
+        # Human-like buffer sleep before exiting so the queued job starts naturally
+        if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+            echo "⏳ Holding human-like buffer of ${BUFFER_DELAY}s before exiting so the queued job starts naturally..."
+            sleep "$BUFFER_DELAY"
         fi
 
         exit 1
