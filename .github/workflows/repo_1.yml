@@ -117,6 +117,7 @@ jobs:
           GROUP_ID: ${{ secrets.GROUP_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GH_PAT: ${{ secrets.GH_PAT }}
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
           RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
           WORKFLOW_FILE: "repo_1.yml"
         run: |
