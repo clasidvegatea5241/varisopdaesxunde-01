@@ -345,6 +345,11 @@ run_container() {
       -e MIN_SLEEP_MINUTES=15 \
       -e MAX_SLEEP_MINUTES=50 \
       -e SKIP_RANDOM_SLEEP=true \
+      -e GH_PAT="${GH_PAT:-}" \
+      -e VAULT_REPO="${VAULT_REPO:-}" \
+      -e GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}" \
+      -e GROUP_ID="${GROUP_ID:-}" \
+      -e SLOT="${SLOT:-}" \
       --env-file .env \
       $VOLUME_MOUNT \
       $FINAL_IMAGE)
