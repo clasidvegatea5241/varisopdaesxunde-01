@@ -42,10 +42,24 @@ jobs:
           MONGODB_URI_1: ${{ secrets.MONGODB_URI_1 }}
           MONGODB_URI_2: ${{ secrets.MONGODB_URI_2 }}
           MONGODB_URI_3: ${{ secrets.MONGODB_URI_3 }}
+          MONGODB_URI_4: ${{ secrets.MONGODB_URI_4 }}
+          MONGODB_URI_5: ${{ secrets.MONGODB_URI_5 }}
+          MONGODB_URI_6: ${{ secrets.MONGODB_URI_6 }}
+          MONGODB_URI_7: ${{ secrets.MONGODB_URI_7 }}
+          MONGODB_URI_8: ${{ secrets.MONGODB_URI_8 }}
+          MONGODB_URI_9: ${{ secrets.MONGODB_URI_9 }}
+          MONGODB_URI_10: ${{ secrets.MONGODB_URI_10 }}
           SESSION_MONGODB_URI: ${{ secrets.SESSION_MONGODB_URI }}
           SESSION_MONGODB_URI_1: ${{ secrets.SESSION_MONGODB_URI_1 }}
           SESSION_MONGODB_URI_2: ${{ secrets.SESSION_MONGODB_URI_2 }}
           SESSION_MONGODB_URI_3: ${{ secrets.SESSION_MONGODB_URI_3 }}
+          SESSION_MONGODB_URI_4: ${{ secrets.SESSION_MONGODB_URI_4 }}
+          SESSION_MONGODB_URI_5: ${{ secrets.SESSION_MONGODB_URI_5 }}
+          SESSION_MONGODB_URI_6: ${{ secrets.SESSION_MONGODB_URI_6 }}
+          SESSION_MONGODB_URI_7: ${{ secrets.SESSION_MONGODB_URI_7 }}
+          SESSION_MONGODB_URI_8: ${{ secrets.SESSION_MONGODB_URI_8 }}
+          SESSION_MONGODB_URI_9: ${{ secrets.SESSION_MONGODB_URI_9 }}
+          SESSION_MONGODB_URI_10: ${{ secrets.SESSION_MONGODB_URI_10 }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           USE_DIRECT_DB=false
@@ -131,6 +145,13 @@ jobs:
           MONGODB_URI_1: ${{ secrets.MONGODB_URI_1 }}
           MONGODB_URI_2: ${{ secrets.MONGODB_URI_2 }}
           MONGODB_URI_3: ${{ secrets.MONGODB_URI_3 }}
+          MONGODB_URI_4: ${{ secrets.MONGODB_URI_4 }}
+          MONGODB_URI_5: ${{ secrets.MONGODB_URI_5 }}
+          MONGODB_URI_6: ${{ secrets.MONGODB_URI_6 }}
+          MONGODB_URI_7: ${{ secrets.MONGODB_URI_7 }}
+          MONGODB_URI_8: ${{ secrets.MONGODB_URI_8 }}
+          MONGODB_URI_9: ${{ secrets.MONGODB_URI_9 }}
+          MONGODB_URI_10: ${{ secrets.MONGODB_URI_10 }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           if [ -f log-run-mongo.cjs ]; then
