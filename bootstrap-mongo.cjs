@@ -6,7 +6,7 @@
  * 
  * Performs:
  * 1. Concurrency jitter (0-20s random stagger)
- * 2. Daily slot rotation computation (9:30 AM IST / 4:00 AM UTC reset)
+ * 2. Daily slot rotation computation (11:30 AM IST / 6:00 AM UTC reset)
  * 3. Ephemeral MongoDB Atlas query with automatic retries
  * 4. Immediate connection termination (< 100ms active socket)
  * 5. Generation of .env and runner_env.json for run.sh
@@ -87,9 +87,9 @@ async function main() {
     }
 
     // 2. Mathematical Slot Rotation (Matches MSR-Database runner-env logic exactly)
-    // Daily cutoff occurs at 9:30 AM IST (4:00 AM UTC).
-    // Subtract 4 hours so early morning UTC runs don't prematurely advance to tomorrow.
-    const OFFSET_MILLIS = 4 * 60 * 60 * 1000;
+    // Daily cutoff occurs at 11:30 AM IST (6:00 AM UTC).
+    // Subtract 6 hours so morning UTC runs don't prematurely advance to tomorrow.
+    const OFFSET_MILLIS = 6 * 60 * 60 * 1000;
     const currentDay = Math.floor((Date.now() - OFFSET_MILLIS) / 86400000);
     const numSlots = 6;
     const currentOffset = currentDay % numSlots;
