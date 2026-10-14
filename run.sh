@@ -47,6 +47,93 @@ if [ -z "$ACCOUNT_EMAIL" ] || [ "$ACCOUNT_EMAIL" = "null" ]; then
 fi
 
 # =========================================================
+# Execution Gate: Rollover Safety Guard (Morning Cutoff)
+# =========================================================
+# The daily rotation day flips at 11:30 AM IST (06:00 UTC = 360 minutes).
+# A Microsoft Rewards session takes up to ~1 hour 55 minutes to finish.
+# Therefore, the runner MUST START before 11:30 AM IST to lock in today's authentic
+# shifted slot credentials. If GitHub Actions delays runner boot past 11:30 AM IST,
+# the bootstrapper would fetch TOMORROW's credentials prematurely.
+# If Slot 7 boots at or after 11:30 AM IST, abort immediately and alert Discord.
+if [ "$SLOT" = "7" ]; then
+    CURRENT_UTC_H=$(date -u +%H)
+    CURRENT_UTC_M=$(date -u +%M)
+    TOTAL_UTC_MINS=$(( 10#$CURRENT_UTC_H * 60 + 10#$CURRENT_UTC_M ))
+
+    # 11:30 AM IST = 06:00 UTC = 360 minutes.
+    # Guard the morning slot window up to minute 600 (10:00 UTC / 3:30 PM IST).
+    if [ "$TOTAL_UTC_MINS" -ge 360 ] && [ "$TOTAL_UTC_MINS" -lt 600 ]; then
+        CURRENT_IST=$(TZ='Asia/Kolkata' date '+%I:%M %p IST' 2>/dev/null || date -u '+%H:%M UTC')
+        CURRENT_UTC=$(date -u '+%H:%M UTC')
+        GUARD_GROUP_NAME="${GROUP_ID:-}"
+        if [ -z "$GUARD_GROUP_NAME" ] && [ -f runner_env.json ]; then
+            GUARD_GROUP_NAME=$(jq -r '.group_id // .group // empty' runner_env.json 2>/dev/null || echo "")
+        fi
+        if [ -z "$GUARD_GROUP_NAME" ]; then
+            GUARD_GROUP_NAME="Unknown"
+        fi
+
+        echo "=========================================================================="
+        echo " ⏰ ROLLOVER GUARD TRIGGERED: Execution Aborted (Start Time Exceeded Cutoff)!"
+        echo "    Runner Boot Time : $CURRENT_IST ($CURRENT_UTC)"
+        echo "    Allowed Cutoff   : 11:30 AM IST (06:00 UTC)"
+        echo "    Group: $GUARD_GROUP_NAME | Slot: $SLOT | Account: $ACCOUNT_EMAIL"
+        echo "    Reason: Runner booted after 11:30 AM IST daily rollover boundary."
+        echo "            Aborting run to prevent pulling tomorrow's rotated account credentials."
+        echo "=========================================================================="
+
+        echo "::warning title=Rollover Guard Aborted::Runner booted past 11:30 AM IST cutoff ($CURRENT_IST). Stopped Group $GUARD_GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL) to protect rotation integrity."
+
+        # Send Discord Webhook Alert if configured
+        DISCORD_URL="${DISCORD_WEBHOOK_URL:-}"
+        if [ -z "$DISCORD_URL" ] && [ -f runner_env.json ]; then
+            DISCORD_URL=$(jq -r '.discord_webhook_url // empty' runner_env.json 2>/dev/null || echo "")
+        fi
+        if [ -z "$DISCORD_URL" ] && [ -f .env ]; then
+            DISCORD_URL=$(grep -E '^CONFIG_DISCORD_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
+        fi
+
+        if [ -n "$DISCORD_URL" ] && [ "$DISCORD_URL" != "null" ]; then
+            DISCORD_DESC="Group **${GUARD_GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was automatically aborted because GitHub Actions delayed the runner boot past the **11:30 AM IST** cutoff.\n\n🛡️ **Cross-Day Protection Active:** The run halted before acquiring credentials to prevent pulling tomorrow's rotated account."
+            DISCORD_FOOTER="Autonomous Rollover Guard • Execution halted to ensure streak & rotation integrity."
+            ISO_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+            DISCORD_PAYLOAD=$(jq -n \
+                --arg group "$GUARD_GROUP_NAME" \
+                --arg email "$ACCOUNT_EMAIL" \
+                --arg slot "$SLOT" \
+                --arg boot_time "$CURRENT_IST" \
+                --arg desc "$DISCORD_DESC" \
+                --arg footer "$DISCORD_FOOTER" \
+                --arg ts "$ISO_TIMESTAMP" \
+                '{
+                    embeds: [{
+                        title: "⏰ Rollover Guard: Morning Run Aborted",
+                        description: $desc,
+                        color: 16744448,
+                        fields: [
+                            { name: "Group", value: $group, inline: true },
+                            { name: "Slot", value: ("Slot " + $slot), inline: true },
+                            { name: "Runner Boot Time", value: $boot_time, inline: true },
+                            { name: "Daily Cutoff Limit", value: "11:30 AM IST (06:00 UTC)", inline: true },
+                            { name: "Safety Status", value: "Safely Aborted (Quota Preserved)", inline: true }
+                        ],
+                        footer: {
+                            text: $footer
+                        },
+                        timestamp: $ts
+                    }]
+                }')
+
+            echo "Sending Rollover Guard notification to Discord..."
+            curl -s -X POST -H "Content-Type: application/json" -d "$DISCORD_PAYLOAD" "$DISCORD_URL" > /dev/null || true
+        fi
+
+        exit 0
+    fi
+fi
+
+# =========================================================
 # Execution Gate: Region Guard (US IP Verification)
 # =========================================================
 ACCOUNT_PROXY_URL=$(grep -E '^ACCOUNT_1_PROXY_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
