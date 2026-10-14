@@ -33,11 +33,26 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install Runner Dependencies
+        run: |
+          npm install --production --no-save mongodb
+
       - name: "Matrix DB Bootstrapper (Dual-Mode: Web + Direct Atlas Fallback)"
         env:
           ORCHESTRATOR_TOKEN: ${{ secrets.ORCHESTRATOR_TOKEN }}
           GROUP_ID: ${{ secrets.GROUP_ID }}
           MATRIX_DB_HOST: ${{ secrets.MATRIX_DB_HOST }}
+          IP_MONGODB_URI: ${{ secrets.IP_MONGODB_URI }}
+          IP_MONGODB_URI_1: ${{ secrets.IP_MONGODB_URI_1 }}
+          IP_MONGODB_URI_2: ${{ secrets.IP_MONGODB_URI_2 }}
+          IP_MONGODB_URI_3: ${{ secrets.IP_MONGODB_URI_3 }}
+          IP_MONGODB_URI_4: ${{ secrets.IP_MONGODB_URI_4 }}
+          IP_MONGODB_URI_5: ${{ secrets.IP_MONGODB_URI_5 }}
+          IP_MONGODB_URI_6: ${{ secrets.IP_MONGODB_URI_6 }}
+          IP_MONGODB_URI_7: ${{ secrets.IP_MONGODB_URI_7 }}
+          IP_MONGODB_URI_8: ${{ secrets.IP_MONGODB_URI_8 }}
+          IP_MONGODB_URI_9: ${{ secrets.IP_MONGODB_URI_9 }}
+          IP_MONGODB_URI_10: ${{ secrets.IP_MONGODB_URI_10 }}
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           MONGODB_URI_1: ${{ secrets.MONGODB_URI_1 }}
           MONGODB_URI_2: ${{ secrets.MONGODB_URI_2 }}
@@ -129,6 +144,28 @@ jobs:
       - name: Run Farm (V4)
         env:
           GROUP_ID: ${{ secrets.GROUP_ID }}
+          IP_MONGODB_URI: ${{ secrets.IP_MONGODB_URI }}
+          IP_MONGODB_URI_1: ${{ secrets.IP_MONGODB_URI_1 }}
+          IP_MONGODB_URI_2: ${{ secrets.IP_MONGODB_URI_2 }}
+          IP_MONGODB_URI_3: ${{ secrets.IP_MONGODB_URI_3 }}
+          IP_MONGODB_URI_4: ${{ secrets.IP_MONGODB_URI_4 }}
+          IP_MONGODB_URI_5: ${{ secrets.IP_MONGODB_URI_5 }}
+          IP_MONGODB_URI_6: ${{ secrets.IP_MONGODB_URI_6 }}
+          IP_MONGODB_URI_7: ${{ secrets.IP_MONGODB_URI_7 }}
+          IP_MONGODB_URI_8: ${{ secrets.IP_MONGODB_URI_8 }}
+          IP_MONGODB_URI_9: ${{ secrets.IP_MONGODB_URI_9 }}
+          IP_MONGODB_URI_10: ${{ secrets.IP_MONGODB_URI_10 }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_URI_1: ${{ secrets.MONGODB_URI_1 }}
+          MONGODB_URI_2: ${{ secrets.MONGODB_URI_2 }}
+          MONGODB_URI_3: ${{ secrets.MONGODB_URI_3 }}
+          MONGODB_URI_4: ${{ secrets.MONGODB_URI_4 }}
+          MONGODB_URI_5: ${{ secrets.MONGODB_URI_5 }}
+          MONGODB_URI_6: ${{ secrets.MONGODB_URI_6 }}
+          MONGODB_URI_7: ${{ secrets.MONGODB_URI_7 }}
+          MONGODB_URI_8: ${{ secrets.MONGODB_URI_8 }}
+          MONGODB_URI_9: ${{ secrets.MONGODB_URI_9 }}
+          MONGODB_URI_10: ${{ secrets.MONGODB_URI_10 }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GH_PAT: ${{ secrets.GH_PAT }}
           VAULT_REPO: ${{ secrets.VAULT_REPO }}
@@ -141,6 +178,17 @@ jobs:
         if: always()
         env:
           GROUP_ID: ${{ secrets.GROUP_ID }}
+          IP_MONGODB_URI: ${{ secrets.IP_MONGODB_URI }}
+          IP_MONGODB_URI_1: ${{ secrets.IP_MONGODB_URI_1 }}
+          IP_MONGODB_URI_2: ${{ secrets.IP_MONGODB_URI_2 }}
+          IP_MONGODB_URI_3: ${{ secrets.IP_MONGODB_URI_3 }}
+          IP_MONGODB_URI_4: ${{ secrets.IP_MONGODB_URI_4 }}
+          IP_MONGODB_URI_5: ${{ secrets.IP_MONGODB_URI_5 }}
+          IP_MONGODB_URI_6: ${{ secrets.IP_MONGODB_URI_6 }}
+          IP_MONGODB_URI_7: ${{ secrets.IP_MONGODB_URI_7 }}
+          IP_MONGODB_URI_8: ${{ secrets.IP_MONGODB_URI_8 }}
+          IP_MONGODB_URI_9: ${{ secrets.IP_MONGODB_URI_9 }}
+          IP_MONGODB_URI_10: ${{ secrets.IP_MONGODB_URI_10 }}
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           MONGODB_URI_1: ${{ secrets.MONGODB_URI_1 }}
           MONGODB_URI_2: ${{ secrets.MONGODB_URI_2 }}
