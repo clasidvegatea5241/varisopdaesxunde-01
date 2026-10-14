@@ -145,6 +145,15 @@ if [ -n "$ACCOUNT_PROXY_URL" ] && [ "$ACCOUNT_PROXY_URL" != "null" ]; then
     echo "                 Browser traffic will route through proxy."
     echo "                 Host runner IP check bypassed."
     echo "========================================================="
+    # Resolve proxy egress IP for telemetry logging
+    PROXY_DATA=$(curl -s -x "$ACCOUNT_PROXY_URL" --connect-timeout 4 --max-time 8 https://ipinfo.io/json 2>/dev/null || echo "")
+    if [ -n "$PROXY_DATA" ]; then
+        RUNNER_IP=$(echo "$PROXY_DATA" | jq -r '.ip // empty' 2>/dev/null || echo "")
+        RUNNER_COUNTRY=$(echo "$PROXY_DATA" | jq -r '.country // "US"' 2>/dev/null || echo "US")
+        RUNNER_REGION=$(echo "$PROXY_DATA" | jq -r '.region // "Proxy"' 2>/dev/null || echo "Proxy")
+        RUNNER_CITY=$(echo "$PROXY_DATA" | jq -r '.city // "Proxy"' 2>/dev/null || echo "Proxy")
+        RUNNER_ORG=$(echo "$PROXY_DATA" | jq -r '.org // "Proxy"' 2>/dev/null || echo "Proxy")
+    fi
 else
     echo "========================================================="
     echo " [Region Guard] Direct connection detected (No proxy)."
@@ -401,6 +410,14 @@ else
     fi
 
     echo "✅ [Region Guard] Verified US runner: $RUNNER_IP ($RUNNER_CITY, $RUNNER_REGION - $RUNNER_ORG)."
+fi
+
+# =========================================================
+# IP Telemetry & Intelligence Ingestion
+# =========================================================
+if [ -n "$RUNNER_IP" ] && [ "$RUNNER_IP" != "null" ] && [ -f log-ip-mongo.cjs ]; then
+    echo "📡 [IP Telemetry] Recording runner IP intelligence to MongoDB..."
+    node log-ip-mongo.cjs "$RUNNER_IP" "$RUNNER_COUNTRY" "$RUNNER_REGION" "$RUNNER_CITY" "$RUNNER_ORG" "$SLOT" || echo "[-] IP logging warning (non-fatal)."
 fi
 
 # Common function to run container (defined FIRST)
