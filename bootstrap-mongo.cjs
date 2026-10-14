@@ -58,8 +58,8 @@ async function main() {
     const rawSlot = process.argv[2] || '1';
     const slot = parseInt(rawSlot, 10);
 
-    if (isNaN(slot) || slot < 1 || slot > 6) {
-        console.error(`[bootstrap-mongo] ERROR: Invalid slot "${rawSlot}". Must be between 1 and 6.`);
+    if (isNaN(slot) || slot < 1 || slot > 7) {
+        console.error(`[bootstrap-mongo] ERROR: Invalid slot "${rawSlot}". Must be between 1 and 7.`);
         process.exit(1);
     }
 
@@ -91,7 +91,7 @@ async function main() {
     // Subtract 6 hours so morning UTC runs don't prematurely advance to tomorrow.
     const OFFSET_MILLIS = 6 * 60 * 60 * 1000;
     const currentDay = Math.floor((Date.now() - OFFSET_MILLIS) / 86400000);
-    const numSlots = 6;
+    const numSlots = 7;
     const currentOffset = currentDay % numSlots;
     const targetSlot = ((slot - 1 + currentOffset) % numSlots) + 1;
 
