@@ -86,32 +86,14 @@ async function main() {
         console.log('[bootstrap-mongo] SKIP_JITTER=true detected. Skipping stagger delay.');
     }
 
-    // 2. Mathematical Slot Rotation (Matches MSR-Database runner-env logic exactly)
-    // Daily cutoff occurs at 11:30 AM IST (6:00 AM UTC).
-    // Subtract 6 hours so morning UTC runs don't prematurely advance to tomorrow.
-    const OFFSET_MILLIS = 6 * 60 * 60 * 1000;
-    const currentDay = Math.floor((Date.now() - OFFSET_MILLIS) / 86400000);
-    const numSlots = 7;
-    const currentOffset = currentDay % numSlots;
-    const targetSlot = ((slot - 1 + currentOffset) % numSlots) + 1;
-
-    console.log('=====================================================');
-    console.log('  Dual-Mode Bootstrapper (Direct MongoDB Mode)');
-    console.log(`  Group ID             : ${groupId}`);
-    console.log(`  Cluster Partition    : Cluster ${dataCluster.clusterIndex} (via ${dataCluster.source})`);
-    if (sessionCluster && sessionCluster.source !== dataCluster.source) {
-        console.log(`  Session Partition    : Cluster ${sessionCluster.clusterIndex} (via ${sessionCluster.source})`);
-    }
-    console.log(`  Runner Assigned Slot : SLOT ${slot}`);
-    console.log(`  Daily Rotation Offset: +${currentOffset}`);
-    console.log(`  Actual Target Slot   : SLOT ${targetSlot}`);
-    console.log('=====================================================');
-
-    // 3. Resilient MongoDB Connection with Retry Loop
+    // 2. Resilient MongoDB Connection with Dynamic Rotation Settings Sync
     const maxAttempts = 3;
     let client = null;
     let account = null;
     let group = null;
+    let targetSlot = slot;
+    let numSlots = parseInt(process.env.ROTATION_SLOTS || '6', 10);
+    let currentOffset = 0;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
@@ -136,6 +118,55 @@ async function main() {
 
             const db = client.db(dbName);
             console.log(`[bootstrap-mongo] Connected successfully to database: "${dbName}"`);
+
+            // 2a. Dynamic Fleet-wide Rotation Settings Sync from MongoDB Atlas
+            let remoteSlots = null;
+            let rotationEnabled = true;
+            try {
+                const settingDoc = await db.collection('farming_settings').findOne({ key: 'POD_ROTATION_SLOTS' });
+                if (settingDoc && settingDoc.value) {
+                    remoteSlots = parseInt(settingDoc.value, 10);
+                }
+                const enabledDoc = await db.collection('farming_settings').findOne({ key: 'POD_ROTATION_ENABLED' });
+                if (enabledDoc && (enabledDoc.value === 'false' || enabledDoc.value === false)) {
+                    rotationEnabled = false;
+                }
+            } catch (err) {
+                console.warn('[bootstrap-mongo] Note: Unable to read farming_settings from Atlas, using fallback:', err.message);
+            }
+
+            if (remoteSlots && !isNaN(remoteSlots)) {
+                numSlots = remoteSlots;
+            }
+
+            // 2b. Check if assigned runner slot exceeds active slot capacity (Dormancy Guard)
+            if (slot > numSlots) {
+                console.warn(`[bootstrap-mongo] ⚠️ Runner assigned Slot ${slot} exceeds active rotation slot capacity (${numSlots}).`);
+                console.warn('[bootstrap-mongo] Slot is currently dormant/inactive. Creating placeholder and exiting safely.');
+                await client.close();
+                fs.writeFileSync('.env', '# Slot dormant/inactive\n');
+                fs.writeFileSync('runner_env.json', JSON.stringify({ inactive: true, slot, reason: 'slot_dormant' }, null, 2));
+                process.exit(0);
+            }
+
+            // 2c. Mathematical Slot Rotation (Anchor: 11:30 AM IST / 6:00 AM UTC)
+            const OFFSET_MILLIS = 6 * 60 * 60 * 1000;
+            const currentDay = Math.floor((Date.now() - OFFSET_MILLIS) / 86400000);
+            currentOffset = rotationEnabled ? (currentDay % numSlots) : 0;
+            targetSlot = ((slot - 1 + currentOffset) % numSlots) + 1;
+
+            console.log('=====================================================');
+            console.log('  Dual-Mode Bootstrapper (Direct MongoDB Mode)');
+            console.log(`  Group ID             : ${groupId}`);
+            console.log(`  Cluster Partition    : Cluster ${dataCluster.clusterIndex} (via ${dataCluster.source})`);
+            if (sessionCluster && sessionCluster.source !== dataCluster.source) {
+                console.log(`  Session Partition    : Cluster ${sessionCluster.clusterIndex} (via ${sessionCluster.source})`);
+            }
+            console.log(`  Runner Assigned Slot : SLOT ${slot}`);
+            console.log(`  Rotation Capacity    : ${numSlots} Slots (${remoteSlots ? 'Atlas Synced' : 'Env Fallback'})`);
+            console.log(`  Daily Rotation Offset: +${currentOffset} (${rotationEnabled ? 'ENABLED' : 'DISABLED'})`);
+            console.log(`  Actual Target Slot   : SLOT ${targetSlot}`);
+            console.log('=====================================================');
 
             // Query farming_accounts for this group and rotated slot
             account = await db.collection('farming_accounts').findOne({
