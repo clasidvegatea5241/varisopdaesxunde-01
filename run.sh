@@ -242,19 +242,26 @@ else
 
     IFS="|" read -r RUNNER_IP RUNNER_COUNTRY RUNNER_REGION RUNNER_CITY RUNNER_ORG <<< "$RUNNER_GEO"
 
-    if [ "$RUNNER_COUNTRY" != "US" ]; then
-        # Resolve Group Name/ID
-        GROUP_NAME="${GROUP_ID:-}"
-        if [ -z "$GROUP_NAME" ] && [ -f runner_env.json ]; then
-            GROUP_NAME=$(jq -r '.group_id // .group // empty' runner_env.json 2>/dev/null || echo "")
-        fi
-        if [ -z "$GROUP_NAME" ]; then
-            GROUP_NAME="Unknown"
-        fi
+    # Resolve Group Name/ID for guards
+    GROUP_NAME="${GROUP_ID:-}"
+    if [ -z "$GROUP_NAME" ] && [ -f runner_env.json ]; then
+        GROUP_NAME=$(jq -r '.group_id // .group // empty' runner_env.json 2>/dev/null || echo "")
+    fi
+    if [ -z "$GROUP_NAME" ]; then
+        GROUP_NAME="Unknown"
+    fi
 
-        # ------------------------------------------------------------------
-        # Autonomous Auto-Reroll & Human-like Delay Logic
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Autonomous Auto-Reroll & Human-like Delay Logic (Unified Engine)
+    # ------------------------------------------------------------------
+    trigger_autonomous_reroll() {
+        local GUARD_TYPE="$1"
+        local TITLE="$2"
+        local REASON_SUMMARY="$3"
+        local EMBED_COLOR="$4"
+        local DETAIL_LABEL="$5"
+        local DETAIL_VALUE="$6"
+
         RETRY_ATTEMPT="${RETRY_ATTEMPT:-0}"
         if ! [[ "$RETRY_ATTEMPT" =~ ^[0-9]+$ ]]; then
             RETRY_ATTEMPT=0
@@ -277,6 +284,7 @@ else
 
             echo "=========================================================================="
             echo "🔄 AUTONOMOUS AUTO-REROLL: Dispatching replacement runner..."
+            echo "   Guard Type:       $GUARD_TYPE"
             echo "   Target Workflow:  $TARGET_WORKFLOW"
             echo "   Branch / Ref:     ${GITHUB_REF_NAME:-main}"
             echo "   Attempt:          $NEXT_ATTEMPT of $MAX_RETRIES"
@@ -315,12 +323,12 @@ else
         elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
             echo "=========================================================================="
             echo "⛔ MAX AUTO-RETRIES REACHED ($RETRY_ATTEMPT/$MAX_RETRIES)!"
-            echo "   Foreign IP persisted across multiple attempts. Manual check required."
+            echo "   Issue persisted across multiple attempts. Manual check required."
             echo "=========================================================================="
         fi
 
         echo "=========================================================================="
-        echo "🚨 REGION GUARD: NON-US RUNNER DETECTED!"
+        echo "$TITLE"
         echo "   Group:            $GROUP_NAME"
         echo "   Slot:             Slot $SLOT"
         echo "   Account:          $ACCOUNT_EMAIL"
@@ -328,24 +336,28 @@ else
         echo "   Location:         $RUNNER_CITY, $RUNNER_REGION"
         echo "   Runner Public IP: $RUNNER_IP"
         echo "   ISP / Org:        $RUNNER_ORG"
+        echo "   Reason:           $REASON_SUMMARY"
+        if [ -n "$DETAIL_LABEL" ] && [ -n "$DETAIL_VALUE" ]; then
+            echo "   $DETAIL_LABEL:    $DETAIL_VALUE"
+        fi
         if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
             echo "   Auto-Reroll:      Queued (Attempt $NEXT_ATTEMPT/$MAX_RETRIES, buffer: ${BUFFER_DELAY}s)"
         fi
         echo "--------------------------------------------------------------------------"
-        echo "⛔ Policy requires US IP only. Aborting run to protect account: $ACCOUNT_EMAIL"
+        echo "⛔ Aborting run to protect account: $ACCOUNT_EMAIL"
         if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
             echo "💡 Replacement run is queued and will execute automatically after cooldown."
         else
-            echo "💡 TIP: Click 'Re-run failed jobs' on GitHub to acquire a fresh US runner."
+            echo "💡 TIP: Click 'Re-run failed jobs' on GitHub to acquire a fresh runner."
         fi
         echo "=========================================================================="
 
         if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
-            echo "::error title=Region Guard Blocked (Auto-Reroll Queued)::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Queued replacement run will launch in ~${BUFFER_DELAY}s (Attempt $NEXT_ATTEMPT/$MAX_RETRIES)."
+            echo "::error title=${GUARD_TYPE} Blocked (Auto-Reroll Queued)::${REASON_SUMMARY}. Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Queued replacement run will launch in ~${BUFFER_DELAY}s (Attempt $NEXT_ATTEMPT/$MAX_RETRIES)."
         elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
-            echo "::error title=Region Guard Blocked (Max Retries Reached)::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Max auto-retries reached ($RETRY_ATTEMPT/$MAX_RETRIES)."
+            echo "::error title=${GUARD_TYPE} Blocked (Max Retries Reached)::${REASON_SUMMARY}. Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Max auto-retries reached ($RETRY_ATTEMPT/$MAX_RETRIES)."
         else
-            echo "::error title=Region Guard Blocked::Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION). Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL) to protect account. Click 'Re-run failed jobs' to get a US runner."
+            echo "::error title=${GUARD_TYPE} Blocked::${REASON_SUMMARY}. Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL) to protect account."
         fi
 
         # Send Discord Webhook Alert if configured (Supports Secrets, Matrix DB runner_env.json, and .env)
@@ -358,17 +370,18 @@ else
         fi
         if [ -n "$DISCORD_URL" ] && [ "$DISCORD_URL" != "null" ]; then
             if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
-                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was aborted due to foreign IP.\n🔄 **Auto-Reroll Queued!** Fresh runner will start after ~${BUFFER_DELAY}s buffer (Attempt **${NEXT_ATTEMPT}** of ${MAX_RETRIES})."
+                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was stopped.\n**Reason:** ${REASON_SUMMARY}\n🔄 **Auto-Reroll Queued!** Fresh runner will start after ~${BUFFER_DELAY}s buffer (Attempt **${NEXT_ATTEMPT}** of ${MAX_RETRIES})."
                 DISCORD_FOOTER="Autonomous Auto-Reroll Active • Queued run executes on fresh VM."
             elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
-                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was aborted due to foreign IP.\n⛔ **Max Retries Reached (${RETRY_ATTEMPT}/${MAX_RETRIES})!** Foreign IP persisted."
-                DISCORD_FOOTER="Action: Azure may be experiencing regional congestion. Manual check required."
+                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was stopped.\n**Reason:** ${REASON_SUMMARY}\n⛔ **Max Retries Reached (${RETRY_ATTEMPT}/${MAX_RETRIES})!**"
+                DISCORD_FOOTER="Action: Issue persisted across multiple attempts. Manual check required."
             else
-                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was aborted to protect the account from running on a foreign IP."
-                DISCORD_FOOTER="Action: Click Re-run failed jobs on GitHub to acquire a US runner."
+                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was stopped to protect the account.\n**Reason:** ${REASON_SUMMARY}"
+                DISCORD_FOOTER="Action: Click Re-run failed jobs on GitHub to acquire a fresh runner."
             fi
 
             DISCORD_PAYLOAD=$(jq -n \
+                --arg title "$TITLE" \
                 --arg group "$GROUP_NAME" \
                 --arg email "$ACCOUNT_EMAIL" \
                 --arg slot "$SLOT" \
@@ -378,23 +391,27 @@ else
                 --arg region "$RUNNER_REGION" \
                 --arg desc "$DISCORD_DESC" \
                 --arg footer "$DISCORD_FOOTER" \
+                --argjson color "$EMBED_COLOR" \
+                --arg dlabel "$DETAIL_LABEL" \
+                --arg dval "$DETAIL_VALUE" \
                 '{
                     embeds: [{
-                        title: "🚨 Region Guard: Non-US Runner Blocked",
+                        title: $title,
                         description: $desc,
-                        color: 16711680,
-                        fields: [
+                        color: $color,
+                        fields: ([
                             { name: "Group", value: $group, inline: true },
                             { name: "Slot", value: ("Slot " + $slot), inline: true },
                             { name: "Country", value: $country, inline: true },
                             { name: "Location", value: ($city + ", " + $region), inline: true },
                             { name: "Runner IP", value: $ip, inline: true },
                             { name: "Account", value: $email, inline: false }
-                        ],
+                        ] + (if ($dlabel != "" and $dval != "") then [{ name: $dlabel, value: $dval, inline: false }] else [] end)),
                         footer: { text: $footer },
                         timestamp: (now | todate)
                     }]
                 }' 2>/dev/null || echo "")
+
             if [ -n "$DISCORD_PAYLOAD" ]; then
                 curl -s -H "Content-Type: application/json" -X POST -d "$DISCORD_PAYLOAD" "$DISCORD_URL" >/dev/null 2>&1 || true
             fi
@@ -407,15 +424,66 @@ else
         fi
 
         exit 1
+    }
+
+    # -------------------------------------------------------------
+    # 1. Non-US Foreign IP Region Guard
+    # -------------------------------------------------------------
+    if [ "$RUNNER_COUNTRY" != "US" ]; then
+        trigger_autonomous_reroll \
+            "Region Guard" \
+            "🚨 REGION GUARD: NON-US RUNNER DETECTED!" \
+            "Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION)" \
+            16711680 \
+            "Foreign Location" \
+            "$RUNNER_CITY, $RUNNER_REGION ($RUNNER_COUNTRY)"
     fi
 
     echo "✅ [Region Guard] Verified US runner: $RUNNER_IP ($RUNNER_CITY, $RUNNER_REGION - $RUNNER_ORG)."
 fi
 
 # =========================================================
-# IP Telemetry & Intelligence Ingestion
+# Pre-Flight IP Collision & Frequency Shield
 # =========================================================
-if [ -n "$RUNNER_IP" ] && [ "$RUNNER_IP" != "null" ] && [ -f log-ip-mongo.cjs ]; then
+if [ -n "$RUNNER_IP" ] && [ "$RUNNER_IP" != "null" ] && [ -f verify-ip-guard.cjs ]; then
+    echo "🛡️ [IP Collision Shield] Auditing IP collision & frequency gates in MongoDB Atlas..."
+    IP_GUARD_RAW=$(node verify-ip-guard.cjs "$RUNNER_IP" "$RUNNER_COUNTRY" "$RUNNER_REGION" "$RUNNER_CITY" "$RUNNER_ORG" "$SLOT" 2>&1)
+    IP_GUARD_EXIT=$?
+
+    IP_GUARD_JSON=$(echo "$IP_GUARD_RAW" | grep -E '^\{.*\}$' | tail -n 1 || echo "")
+    IP_STATUS=$(echo "$IP_GUARD_JSON" | jq -r '.status // empty' 2>/dev/null || echo "")
+
+    if [ "$IP_GUARD_EXIT" -eq 2 ] || [ "$IP_STATUS" = "BLOCKED" ]; then
+        GATE=$(echo "$IP_GUARD_JSON" | jq -r '.gate // "COOLDOWN"' 2>/dev/null || echo "COOLDOWN")
+        REASON=$(echo "$IP_GUARD_JSON" | jq -r '.reason // "IP collision detected"' 2>/dev/null || echo "IP collision detected")
+        DETAIL_STR=$(echo "$IP_GUARD_JSON" | jq -r '.detail_str // empty' 2>/dev/null || echo "")
+
+        if [ "$GATE" = "DAILY_CAP" ]; then
+            trigger_autonomous_reroll \
+                "IP Frequency Guard" \
+                "🛡️ PRE-FLIGHT GUARD: DAILY IP CAP REACHED!" \
+                "$REASON" \
+                15105570 \
+                "Daily Cap Status" \
+                "$DETAIL_STR"
+        else
+            trigger_autonomous_reroll \
+                "IP Collision Guard" \
+                "🛡️ PRE-FLIGHT GUARD: IP COLLISION AVOIDED!" \
+                "$REASON" \
+                15105570 \
+                "Collision Detail" \
+                "$DETAIL_STR"
+        fi
+    else
+        PASS_MSG=$(echo "$IP_GUARD_JSON" | jq -r '.message // empty' 2>/dev/null || echo "")
+        if [ -n "$PASS_MSG" ]; then
+            echo "✅ [IP Collision Shield] $PASS_MSG"
+        else
+            echo "✅ [IP Collision Shield] Runner IP verified clean."
+        fi
+    fi
+elif [ -n "$RUNNER_IP" ] && [ "$RUNNER_IP" != "null" ] && [ -f log-ip-mongo.cjs ]; then
     echo "📡 [IP Telemetry] Recording runner IP intelligence to MongoDB..."
     node log-ip-mongo.cjs "$RUNNER_IP" "$RUNNER_COUNTRY" "$RUNNER_REGION" "$RUNNER_CITY" "$RUNNER_ORG" "$SLOT" || echo "[-] IP logging warning (non-fatal)."
 fi
