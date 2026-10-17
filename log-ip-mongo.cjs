@@ -161,6 +161,19 @@ async function main() {
         const db = client.db(dbName);
         const col = db.collection('runner_ip_logs');
 
+        // Check if recently logged by verify-ip-guard.cjs within last 5 minutes
+        const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
+        const alreadyLogged = await col.findOne({
+            ip: runnerIp.trim(),
+            email: accountEmail.trim(),
+            timestamp_utc: { $gte: fiveMinutesAgo }
+        });
+
+        if (alreadyLogged) {
+            console.log(`[log-ip-mongo] IP ${runnerIp} already registered by Pre-Flight IP Shield. Skipping duplicate.`);
+            return;
+        }
+
         await col.insertOne(doc);
         console.log(`[log-ip-mongo] ✅ Logged Runner IP ${runnerIp} (${runnerCity}, ${runnerRegion} • ${runnerOrg}) for ${accountEmail} [Rotation Date: ${rotationDate}] via ${targetCluster.source}`);
     } catch (err) {
