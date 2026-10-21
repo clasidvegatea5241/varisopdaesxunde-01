@@ -58,8 +58,8 @@ async function main() {
     const rawSlot = process.argv[2] || '1';
     const slot = parseInt(rawSlot, 10);
 
-    if (isNaN(slot) || slot < 1 || slot > 7) {
-        console.error(`[bootstrap-mongo] ERROR: Invalid slot "${rawSlot}". Must be between 1 and 7.`);
+    if (isNaN(slot) || slot < 1 || slot > 9) {
+        console.error(`[bootstrap-mongo] ERROR: Invalid slot "${rawSlot}". Must be between 1 and 9.`);
         process.exit(1);
     }
 
@@ -94,6 +94,8 @@ async function main() {
     let targetSlot = slot;
     let numSlots = parseInt(process.env.ROTATION_SLOTS || '6', 10);
     let currentOffset = 0;
+    let isExperimentalSlot = false;
+    let experimentalTeam = 'NONE';
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
@@ -139,21 +141,59 @@ async function main() {
                 numSlots = remoteSlots;
             }
 
-            // 2b. Check if assigned runner slot exceeds active slot capacity (Dormancy Guard)
-            if (slot > numSlots) {
+            // Query farming_groups for group-level settings and execution_mode
+            group = await db.collection('farming_groups').findOne({
+                group_id: groupId
+            });
+            const executionMode = (group && group.execution_mode) || 'DEFAULT';
+
+            // 2b. Mathematical Slot Rotation & Dual Experimental Subsystem
+            const OFFSET_MILLIS = 6 * 60 * 60 * 1000;
+            const currentDay = Math.floor((Date.now() - OFFSET_MILLIS) / 86400000);
+
+            if (executionMode === '1_DAY_GAP' && slot >= 7 && slot <= 9) {
+                // Mode 1: Experimental Circular 1-Day Gap Subsystem (12-Slot Ping-Pong with 48h rest)
+                // Team A: Slots 7, 8, 9 (base: 7)
+                // Team B: Slots 10, 11, 12 (base: 10)
+                // Accounts rotate circularly across repo_7, repo_8, repo_9 every 48h per team
+                isExperimentalSlot = true;
+                const isTeamBActive = currentDay % 2 === 1;
+                experimentalTeam = isTeamBActive ? 'TEAM_B' : 'TEAM_A';
+                const cycleShift = Math.floor(currentDay / 2) % 3;
+                const runnerIdx = slot - 7;
+                const baseSlot = isTeamBActive ? 10 : 7;
+                targetSlot = baseSlot + ((runnerIdx + cycleShift) % 3);
+                currentOffset = 0; // Decoupled from main sequential cron rotation
+            } else if (executionMode === '3_DAY_ROTATION' && slot >= 7 && slot <= 9) {
+                // Mode 2: Experimental 3-Day Rotation Subsystem (Slots 7–9 Only)
+                // Slots 7, 8, 9 cycle circularly across repo_7, repo_8, repo_9 every 3 days. Slots 10–12 bypassed.
+                isExperimentalSlot = true;
+                const offset = currentDay % 3;
+                const runnerIdx = slot - 7;
+                targetSlot = 7 + ((runnerIdx + offset) % 3);
+                experimentalTeam = `3-Day Cycle (Offset +${offset})`;
+                currentOffset = 0;
+            } else if (executionMode === '3_DAY_ROTATION' && slot >= 10) {
+                // In 3-Day Rotation mode, Slots 10, 11, 12 are strictly dormant and bypassed
+                console.warn(`[bootstrap-mongo] ⚠️ Runner assigned Slot ${slot} is bypassed in 3-Day Rotation mode (only Slots 7–9 are active).`);
+                console.warn('[bootstrap-mongo] Slot is dormant/inactive. Creating placeholder and exiting safely.');
+                await client.close();
+                fs.writeFileSync('.env', '# Slot dormant/inactive in 3-Day Rotation mode\n');
+                fs.writeFileSync('runner_env.json', JSON.stringify({ inactive: true, slot, reason: 'slot_bypassed_in_3_day_rotation' }, null, 2));
+                process.exit(0);
+            } else if (slot > numSlots) {
+                // Standard Dormancy Guard for sequentially rotated slots
                 console.warn(`[bootstrap-mongo] ⚠️ Runner assigned Slot ${slot} exceeds active rotation slot capacity (${numSlots}).`);
                 console.warn('[bootstrap-mongo] Slot is currently dormant/inactive. Creating placeholder and exiting safely.');
                 await client.close();
                 fs.writeFileSync('.env', '# Slot dormant/inactive\n');
                 fs.writeFileSync('runner_env.json', JSON.stringify({ inactive: true, slot, reason: 'slot_dormant' }, null, 2));
                 process.exit(0);
+            } else {
+                // Standard Mathematical Slot Rotation (Anchor: 11:30 AM IST / 6:00 AM UTC)
+                currentOffset = rotationEnabled ? (currentDay % numSlots) : 0;
+                targetSlot = ((slot - 1 + currentOffset) % numSlots) + 1;
             }
-
-            // 2c. Mathematical Slot Rotation (Anchor: 11:30 AM IST / 6:00 AM UTC)
-            const OFFSET_MILLIS = 6 * 60 * 60 * 1000;
-            const currentDay = Math.floor((Date.now() - OFFSET_MILLIS) / 86400000);
-            currentOffset = rotationEnabled ? (currentDay % numSlots) : 0;
-            targetSlot = ((slot - 1 + currentOffset) % numSlots) + 1;
 
             console.log('=====================================================');
             console.log('  Dual-Mode Bootstrapper (Direct MongoDB Mode)');
@@ -164,19 +204,26 @@ async function main() {
             }
             console.log(`  Runner Assigned Slot : SLOT ${slot}`);
             console.log(`  Rotation Capacity    : ${numSlots} Slots (${remoteSlots ? 'Atlas Synced' : 'Env Fallback'})`);
-            console.log(`  Daily Rotation Offset: +${currentOffset} (${rotationEnabled ? 'ENABLED' : 'DISABLED'})`);
-            console.log(`  Actual Target Slot   : SLOT ${targetSlot}`);
+            console.log(`  Group Execution Mode : ${executionMode}`);
+            if (isExperimentalSlot) {
+                if (executionMode === '1_DAY_GAP') {
+                    const cycleShift = Math.floor(currentDay / 2) % 3;
+                    console.log(`  Subsystem Mode       : 🧪 Experimental 1-Day Gap (${experimentalTeam}, Shift +${cycleShift})`);
+                } else if (executionMode === '3_DAY_ROTATION') {
+                    const offset = currentDay % 3;
+                    console.log(`  Subsystem Mode       : 🧪 Experimental 3-Day Rotation (Offset +${offset})`);
+                }
+                console.log(`  Target Account Slot  : SLOT ${targetSlot} (Circularly routed from Runner Slot ${slot})`);
+            } else {
+                console.log(`  Daily Rotation Offset: +${currentOffset} (${rotationEnabled ? 'ENABLED' : 'DISABLED'})`);
+                console.log(`  Actual Target Slot   : SLOT ${targetSlot}`);
+            }
             console.log('=====================================================');
 
             // Query farming_accounts for this group and rotated slot
             account = await db.collection('farming_accounts').findOne({
                 group_id: groupId,
                 slot: targetSlot
-            });
-
-            // Query farming_groups for group-level settings
-            group = await db.collection('farming_groups').findOne({
-                group_id: groupId
             });
 
             // Instant disconnect to release socket back to M0 pool immediately
@@ -264,6 +311,10 @@ async function main() {
         group_mode: group?.execution_mode || 'DEFAULT',
         discord_webhook_url: discordWebhookUrl,
         session_mongodb_uri: sessionMongoUri,
+        rotation_slots: numSlots,
+        target_slot: targetSlot,
+        experimental_mode: isExperimentalSlot,
+        experimental_team: experimentalTeam,
         [`account_${slot}`]: account.email,
         [`docker_override_${slot}`]: dockerOverride,
         [`config_override_${slot}`]: configOverride
