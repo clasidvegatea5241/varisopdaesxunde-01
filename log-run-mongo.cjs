@@ -92,6 +92,68 @@ function resolveMongoUri(groupId, type = 'data') {
     return null;
 }
 
+// Cross-Cluster Data Fallback: Scan across all configured MONGODB_URI_1..10 to find previous account stats
+async function searchAllDataClustersForReward(email, currentClusterIndex) {
+    const cleanEmail = email.trim().toLowerCase();
+    const emailRegex = buildEmailRegex(cleanEmail);
+
+    for (let c = 1; c <= 10; c++) {
+        if (c === currentClusterIndex) continue;
+        const uriKey = `MONGODB_URI_${c}`;
+        const uri = process.env[uriKey] || (c === 1 ? process.env.MONGODB_URI : null);
+        if (!uri || uri === 'null') continue;
+
+        let otherClient = null;
+        try {
+            otherClient = new MongoClient(uri, { serverSelectionTimeoutMS: 5000, connectTimeoutMS: 5000 });
+            await otherClient.connect();
+            const otherDb = otherClient.db('test');
+            const found = await otherDb.collection('rewards_accounts').findOne({ email: emailRegex });
+            if (found) {
+                return { doc: found, clusterIndex: c, uri };
+            }
+        } catch (_) {
+            // Ignore offline/unconfigured cluster errors
+        } finally {
+            if (otherClient) {
+                await otherClient.close().catch(() => {});
+            }
+        }
+    }
+    return null;
+}
+
+// Migrate previous daily ledger records into the current active cluster
+async function migratePriorDailyHistoryIfAny(cleanEmail, fromClusterIndex, toClusterDb) {
+    const uriKey = `MONGODB_URI_${fromClusterIndex}`;
+    const uri = process.env[uriKey] || (fromClusterIndex === 1 ? process.env.MONGODB_URI : null);
+    if (!uri || uri === 'null') return;
+
+    let sourceClient = null;
+    try {
+        sourceClient = new MongoClient(uri, { serverSelectionTimeoutMS: 5000, connectTimeoutMS: 5000 });
+        await sourceClient.connect();
+        const sourceDb = sourceClient.db('test');
+        const docs = await sourceDb.collection('rewards_daily_history').find({ email: buildEmailRegex(cleanEmail) }).toArray();
+        if (docs && docs.length > 0) {
+            for (const d of docs) {
+                const { _id, ...cleanDoc } = d;
+                await toClusterDb.collection('rewards_daily_history').updateOne(
+                    { email: cleanEmail, date: d.date },
+                    { $set: cleanDoc },
+                    { upsert: true }
+                );
+            }
+            await sourceDb.collection('rewards_daily_history').deleteMany({ email: buildEmailRegex(cleanEmail) });
+            console.log(`[log-run-mongo] ✅ Relocated ${docs.length} prior daily history records from Cluster ${fromClusterIndex} -> active cluster.`);
+        }
+    } catch (e) {
+        // Non-fatal
+    } finally {
+        if (sourceClient) await sourceClient.close().catch(() => {});
+    }
+}
+
 async function main() {
     const rawSlot = process.argv[2] || '1';
     const groupId = process.env.GROUP_ID || '001';
@@ -224,26 +286,108 @@ async function main() {
 
             // Increment run_days and offline_run_days if run completed or earned points
             if (status === 'Finished' || (pointsGained !== null && pointsGained > 0)) {
-                rewardsUpdateOp.$inc = { run_days: 1, offline_run_days: 1 };
+                rewardsUpdateOp.$inc = { run_days: 1, offline_run_days: 1, active_streak_days: 1 };
             }
 
             // Resilient case-insensitive update for rewards_accounts (avoids duplicate casing records)
-            const emailRegex = buildEmailRegex(accountEmail);
-            const existingReward = await db.collection('rewards_accounts').findOne({ email: emailRegex });
+            const cleanEmail = accountEmail.trim().toLowerCase();
+            const emailRegex = buildEmailRegex(cleanEmail);
+            let existingReward = await db.collection('rewards_accounts').findOne({ email: emailRegex });
+
+            // No-Web Cross-Cluster Fallback: If not found in active cluster, search across other clusters
+            let inheritedClusterIndex = null;
+            if (!existingReward) {
+                try {
+                    const inherited = await searchAllDataClustersForReward(cleanEmail, dataCluster.clusterIndex);
+                    if (inherited && inherited.doc) {
+                        console.log(`[log-run-mongo] 🔄 Discovered previous account stats in Cluster ${inherited.clusterIndex} (Run Days: ${inherited.doc.run_days}, Points: ${inherited.doc.total_points}). Carrying forward!`);
+                        existingReward = inherited.doc;
+                        inheritedClusterIndex = inherited.clusterIndex;
+
+                        // Inherit prior run_days, synced_offline_run_days, and active_streak_days
+                        updateFields.run_days = (inherited.doc.run_days || 0) + (status === 'Finished' || (pointsGained !== null && pointsGained > 0) ? 1 : 0);
+                        updateFields.offline_run_days = (inherited.doc.offline_run_days || 0) + (status === 'Finished' || (pointsGained !== null && pointsGained > 0) ? 1 : 0);
+                        updateFields.synced_offline_run_days = inherited.doc.synced_offline_run_days || 0;
+                        updateFields.active_streak_days = inherited.doc.active_streak_days || 0;
+                        if (inherited.doc.notes) updateFields.notes = inherited.doc.notes;
+
+                        // Remove $inc since we already carried forward and added today's increment directly
+                        delete rewardsUpdateOp.$inc;
+
+                        // Purge old record from source cluster to eliminate ghost duplicate
+                        try {
+                            const delClient = new MongoClient(inherited.uri, { serverSelectionTimeoutMS: 5000 });
+                            await delClient.connect();
+                            await delClient.db('test').collection('rewards_accounts').deleteOne({ _id: inherited.doc._id });
+                            await delClient.close().catch(() => {});
+                            console.log(`[log-run-mongo] ✅ Successfully purged stale ghost record from Cluster ${inherited.clusterIndex}.`);
+                        } catch (delErr) {
+                            console.warn(`[log-run-mongo] Notice: Could not purge stale record from Cluster ${inherited.clusterIndex}:`, delErr.message);
+                        }
+                    }
+                } catch (inhErr) {
+                    console.warn('[log-run-mongo] Cross-cluster rewards fallback notice:', inhErr.message);
+                }
+            }
+
             if (existingReward) {
                 await db.collection('rewards_accounts').updateOne(
-                    { _id: existingReward._id },
-                    rewardsUpdateOp
+                    { email: emailRegex },
+                    rewardsUpdateOp,
+                    { upsert: true }
                 );
             } else {
                 rewardsUpdateOp.$setOnInsert = { synced_offline_run_days: 0 };
                 await db.collection('rewards_accounts').updateOne(
-                    { email: accountEmail },
+                    { email: cleanEmail },
                     rewardsUpdateOp,
                     { upsert: true }
                 );
             }
             console.log(`[log-run-mongo] ✅ Successfully updated rewards_accounts in MongoDB.`);
+
+            // Relocate prior daily ledger records if account moved across clusters
+            if (inheritedClusterIndex) {
+                await migratePriorDailyHistoryIfAny(cleanEmail, inheritedClusterIndex, db);
+            }
+
+            // 2b. Write/Upsert to rewards_daily_history (Daily Points History Ledger)
+            try {
+                const todayDateStr = new Date().toISOString().split('T')[0];
+                const numericDuration = parseFloat(runtimeMinutes) || 0;
+                const numericEarned = pointsGained !== null ? pointsGained : 0;
+                const numericBalance = currentBalance !== null ? currentBalance : (existingReward?.total_points || 0);
+
+                const historyDoc = {
+                    email: cleanEmail,
+                    date: todayDateStr,
+                    points_earned: numericEarned,
+                    total_points: numericBalance,
+                    status: status,
+                    duration_minutes: numericDuration,
+                    group_id: String(groupId).padStart(3, '0'),
+                    slot: parseInt(rawSlot, 10) || 1,
+                    cluster_index: dataCluster.clusterIndex || 1,
+                    timestamp: new Date().toISOString(),
+                    created_at: Date.now()
+                };
+
+                await db.collection('rewards_daily_history').updateOne(
+                    { email: cleanEmail, date: todayDateStr },
+                    { $set: historyDoc },
+                    { upsert: true }
+                );
+
+                // Auto-ensure compound unique index on first write
+                db.collection('rewards_daily_history').createIndex(
+                    { email: 1, date: 1 },
+                    { unique: true }
+                ).catch(() => {});
+
+                console.log(`[log-run-mongo] ✅ Successfully recorded daily history entry in rewards_daily_history for ${todayDateStr} (+${numericEarned} pts).`);
+            } catch (histErr) {
+                console.warn('[log-run-mongo] Notice: Could not record in rewards_daily_history:', histErr.message);
+            }
 
             // Also update farming_accounts collection
             const farmingUpdate = {
@@ -254,16 +398,23 @@ async function main() {
                 farmingUpdate.total_points = currentBalance;
             }
 
+            const farmingUpdateOp = {
+                $set: farmingUpdate
+            };
+            if (status === 'Finished' || (pointsGained !== null && pointsGained > 0)) {
+                farmingUpdateOp.$inc = { active_streak_days: 1 };
+            }
+
             const existingFarming = await db.collection('farming_accounts').findOne({ email: emailRegex });
             if (existingFarming) {
                 await db.collection('farming_accounts').updateOne(
                     { _id: existingFarming._id },
-                    { $set: farmingUpdate }
+                    farmingUpdateOp
                 );
             } else {
                 await db.collection('farming_accounts').updateOne(
                     { email: accountEmail },
-                    { $set: farmingUpdate }
+                    farmingUpdateOp
                 );
             }
             console.log(`[log-run-mongo] ✅ Successfully updated farming_accounts in MongoDB.`);
