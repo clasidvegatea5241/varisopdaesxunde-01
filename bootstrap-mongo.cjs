@@ -15,6 +15,7 @@
 const { MongoClient } = require('mongodb');
 const fs = require('node:fs');
 const path = require('node:path');
+const https = require('node:https');
 
 // Helper for waiting
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -52,6 +53,547 @@ function resolveMongoUri(groupId, type = 'data') {
     }
 
     return null;
+}
+
+// Extract database name from URI if present, otherwise default to 'test'
+function extractDbName(uri) {
+    try {
+        const urlParsed = new URL(uri.replace(/^mongodb\+srv:\/\//, 'http://'));
+        if (urlParsed.pathname && urlParsed.pathname.length > 1) {
+            return urlParsed.pathname.substring(1).split('?')[0];
+        }
+    } catch (_) {}
+    return 'test';
+}
+
+// Escape special regex characters in email strings
+function escapeRegex(str) {
+    return String(str).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Helper to send Discord webhook embed natively
+function sendDiscordEmbed(webhookUrl, payload) {
+    if (!webhookUrl || webhookUrl === 'null' || typeof webhookUrl !== 'string') return Promise.resolve();
+    return new Promise((resolve) => {
+        try {
+            const url = new URL(webhookUrl);
+            const data = JSON.stringify(payload);
+            const req = https.request({
+                hostname: url.hostname,
+                path: url.pathname + url.search,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(data)
+                }
+            }, (res) => {
+                res.resume();
+                resolve();
+            });
+
+            req.on('error', (e) => {
+                console.warn('[bootstrap-mongo] Discord webhook request error:', e.message);
+                resolve();
+            });
+
+            req.write(data);
+            req.end();
+        } catch (e) {
+            console.warn('[bootstrap-mongo] Failed to format Discord webhook:', e.message);
+            resolve();
+        }
+    });
+}
+
+// Fetch dynamic streak guard settings from farming_settings in Atlas
+async function getStreakSettings(db) {
+    const settings = {
+        maxStreakDays: 12,
+        minRestHours: 48,
+        autoSubstitutionEnabled: true,
+        allowEmptySlotsOnFatigue: false
+    };
+
+    try {
+        const col = db.collection('farming_settings');
+        const maxDoc = await col.findOne({ key: 'STREAK_MAX_DAYS' });
+        if (maxDoc && maxDoc.value) {
+            const val = parseInt(maxDoc.value, 10);
+            if (!isNaN(val) && val >= 6) settings.maxStreakDays = val;
+        }
+
+        const restDoc = await col.findOne({ key: 'STREAK_REST_HOURS' });
+        if (restDoc && restDoc.value) {
+            const val = parseInt(restDoc.value, 10);
+            if (!isNaN(val) && val >= 12) settings.minRestHours = val;
+        }
+
+        const autoDoc = await col.findOne({ key: 'STREAK_AUTO_SUBSTITUTION' });
+        if (autoDoc && (autoDoc.value === 'false' || autoDoc.value === false)) {
+            settings.autoSubstitutionEnabled = false;
+        }
+
+        const emptyDoc = await col.findOne({ key: 'STREAK_ALLOW_EMPTY_SLOTS' });
+        if (emptyDoc && (emptyDoc.value === 'true' || emptyDoc.value === true)) {
+            settings.allowEmptySlotsOnFatigue = true;
+        }
+    } catch (err) {
+        console.warn('[bootstrap-mongo] Note: Unable to read streak settings from Atlas, using defaults:', err.message);
+    }
+
+    return settings;
+}
+
+// Calculate active consecutive streak days from runner_ip_logs across IP clusters
+async function calculateStreakForAccount(email) {
+    const cleanEmail = (email || '').trim().toLowerCase();
+    if (!cleanEmail) return 0;
+
+    try {
+        const dateSet = new Set();
+        // Query IP clusters (1 to 10)
+        for (let c = 1; c <= 10; c++) {
+            const ipKey = `IP_MONGODB_URI_${c}`;
+            const dataKey = `MONGODB_URI_${c}`;
+            const uri = process.env[ipKey] || (c === 1 ? process.env.IP_MONGODB_URI : null) || process.env[dataKey] || (c === 1 ? process.env.MONGODB_URI : null);
+            if (!uri || uri === 'null') continue;
+
+            let ipClient = null;
+            try {
+                ipClient = new MongoClient(uri, { serverSelectionTimeoutMS: 5000, connectTimeoutMS: 5000 });
+                await ipClient.connect();
+                const ipDb = ipClient.db(extractDbName(uri));
+                const col = ipDb.collection('runner_ip_logs');
+                const dates = await col.distinct('rotation_date', {
+                    email: { $regex: new RegExp(`^${escapeRegex(cleanEmail)}$`, 'i') }
+                });
+                if (dates && Array.isArray(dates)) {
+                    dates.forEach(d => {
+                        if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)) {
+                            dateSet.add(d);
+                        }
+                    });
+                }
+                await ipClient.close();
+            } catch (_) {
+                if (ipClient) { try { await ipClient.close(); } catch (_) {} }
+            }
+        }
+
+        if (dateSet.size === 0) return 0;
+
+        const validDates = Array.from(dateSet).sort((a, b) => b.localeCompare(a));
+        if (validDates.length === 0) return 0;
+
+        // If latest run was > 2 days ago, streak has broken and reset to 0
+        const latestRunDate = new Date(validDates[0] + 'T00:00:00Z');
+        const now = new Date();
+        const todayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+        const daysSinceLastRun = Math.round((todayUTC.getTime() - latestRunDate.getTime()) / (1000 * 3600 * 24));
+        if (daysSinceLastRun > 2) {
+            return 0;
+        }
+
+        let streak = 0;
+        let prevDate = null;
+        for (const dateStr of validDates) {
+            const currentDate = new Date(dateStr + 'T00:00:00Z');
+            if (isNaN(currentDate.getTime())) continue;
+
+            if (prevDate === null) {
+                streak = 1;
+                prevDate = currentDate;
+            } else {
+                const diffTime = prevDate.getTime() - currentDate.getTime();
+                const diffDays = Math.round(diffTime / (1000 * 3600 * 24));
+
+                if (diffDays === 1) {
+                    streak++;
+                    prevDate = currentDate;
+                } else if (diffDays === 0) {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+        return streak;
+    } catch (err) {
+        console.warn(`[bootstrap-mongo] Warning: Streak calculation error for ${cleanEmail}:`, err.message);
+        return 0;
+    }
+}
+
+// Atomically update session_registry coordinates across session clusters
+async function updateSessionRegistryLocation(email, targetGroupId, targetSlot) {
+    if (!email) return false;
+    const cleanEmail = email.trim();
+    for (let c = 1; c <= 10; c++) {
+        const sessionKey = `SESSION_MONGODB_URI_${c}`;
+        const dataKey = `MONGODB_URI_${c}`;
+        const uri = process.env[sessionKey] || (c === 1 ? process.env.SESSION_MONGODB_URI : null) || process.env[dataKey] || (c === 1 ? process.env.MONGODB_URI : null);
+        if (!uri || uri === 'null') continue;
+
+        let sClient = null;
+        try {
+            sClient = new MongoClient(uri, { serverSelectionTimeoutMS: 5000, connectTimeoutMS: 5000 });
+            await sClient.connect();
+            const sDb = sClient.db(extractDbName(uri));
+            const regCol = sDb.collection('session_registry');
+            const emailRegex = new RegExp(`^${escapeRegex(cleanEmail)}$`, 'i');
+
+            const existing = await regCol.findOne({ email: emailRegex });
+            if (existing) {
+                await regCol.updateOne(
+                    { _id: existing._id },
+                    {
+                        $set: {
+                            current_group_id: String(targetGroupId).padStart(3, '0'),
+                            current_slot: Number(targetSlot),
+                            updated_at: new Date().toISOString()
+                        }
+                    }
+                );
+                console.log(`[bootstrap-mongo] 🎯 Aligned session_registry for ${cleanEmail} -> Group ${targetGroupId}, Slot ${targetSlot} (Cluster ${c})`);
+                await sClient.close();
+                return true;
+            }
+            await sClient.close();
+        } catch (_) {
+            if (sClient) { try { await sClient.close(); } catch (_) {} }
+        }
+    }
+    return false;
+}
+
+// Autonomous Vacant Slot Auto-Fill from Streak Archive
+async function autoFillVacantSlot(db, groupId, targetSlot, dataCluster, discordWebhookUrl) {
+    try {
+        const now = Date.now();
+        const archiveCol = db.collection('streak_archive_accounts');
+
+        // Query eligible rested accounts from local cluster
+        const eligibleAccounts = await archiveCol.find({
+            $or: [
+                { ready_at: { $lte: now } },
+                { status: 'READY' }
+            ]
+        }).sort({ archived_at: 1 }).toArray();
+
+        let matchedAccount = null;
+
+        if (eligibleAccounts && eligibleAccounts.length > 0) {
+            const local = eligibleAccounts.find(a => (a.cluster_origin || 1) === dataCluster.clusterIndex);
+            const target = local || eligibleAccounts[0];
+            const claimed = await archiveCol.findOneAndDelete({ _id: target._id });
+            matchedAccount = claimed ? (claimed.value || claimed) : null;
+        }
+
+        // Cross-cluster search if none found in local database
+        if (!matchedAccount) {
+            for (let c = 1; c <= 10; c++) {
+                if (c === dataCluster.clusterIndex) continue;
+                const cKey = `MONGODB_URI_${c}`;
+                const cUri = process.env[cKey];
+                if (!cUri || cUri === 'null') continue;
+
+                let cClient = null;
+                try {
+                    cClient = new MongoClient(cUri, { serverSelectionTimeoutMS: 5000, connectTimeoutMS: 5000 });
+                    await cClient.connect();
+                    const cDb = cClient.db(extractDbName(cUri));
+                    const cCol = cDb.collection('streak_archive_accounts');
+                    const crossEligible = await cCol.find({
+                        $or: [
+                            { ready_at: { $lte: now } },
+                            { status: 'READY' }
+                        ]
+                    }).sort({ archived_at: 1 }).limit(1).toArray();
+
+                    if (crossEligible && crossEligible.length > 0) {
+                        const claimed = await cCol.findOneAndDelete({ _id: crossEligible[0]._id });
+                        if (claimed) {
+                            matchedAccount = claimed.value || claimed;
+                            await cClient.close();
+                            break;
+                        }
+                    }
+                    await cClient.close();
+                } catch (_) {
+                    if (cClient) { try { await cClient.close(); } catch (_) {} }
+                }
+            }
+        }
+
+        if (!matchedAccount || !matchedAccount.email) {
+            console.log(`[bootstrap-mongo] No rested bench accounts available to auto-fill Slot ${targetSlot}.`);
+            return null;
+        }
+
+        console.log(`[bootstrap-mongo] ✨ Claimed rested bench account: ${matchedAccount.email} (Cluster Origin: ${matchedAccount.cluster_origin || 1})`);
+
+        // Format document for farming_accounts
+        const newFarmingDoc = {
+            group_id: String(groupId),
+            slot: Number(targetSlot),
+            email: matchedAccount.email,
+            password: matchedAccount.password || null,
+            totp_secret: matchedAccount.totp_secret || null,
+            recovery_email: matchedAccount.recovery_email || null,
+            geo_locale: matchedAccount.geo_locale || 'auto',
+            lang_code: matchedAccount.lang_code || 'en',
+            proxy_http: matchedAccount.proxy_http || 'false',
+            proxy_url: matchedAccount.proxy_url || null,
+            proxy_port: matchedAccount.proxy_port || null,
+            proxy_username: matchedAccount.proxy_username || null,
+            proxy_password: matchedAccount.proxy_password || null,
+            docker_image: matchedAccount.docker_image || null,
+            config_override: matchedAccount.config_override || null,
+            dockerfile_override: matchedAccount.dockerfile_override || null,
+            script_override: matchedAccount.script_override || null,
+            is_active: 1,
+            last_run: null,
+            last_status: 'Bench Injected',
+            total_points: 0,
+            updated_at: new Date().toISOString()
+        };
+
+        await db.collection('farming_accounts').updateOne(
+            { group_id: String(groupId), slot: Number(targetSlot) },
+            { $set: newFarmingDoc },
+            { upsert: true }
+        );
+
+        await updateSessionRegistryLocation(matchedAccount.email, groupId, targetSlot);
+
+        if (discordWebhookUrl) {
+            await sendDiscordEmbed(discordWebhookUrl, {
+                embeds: [{
+                    title: '✨ Autonomous Slot Auto-Fill (Direct Mode)',
+                    description: `Successfully filled vacant **Slot ${targetSlot}** in **Group ${groupId}** with rested bench account.`,
+                    color: 0x10b981, // Emerald
+                    fields: [
+                        { name: 'Injected Account', value: `\`${matchedAccount.email}\``, inline: true },
+                        { name: 'Target Slot', value: `Group ${groupId} • Slot ${targetSlot}`, inline: true },
+                        { name: 'Origin Cluster', value: `Cluster ${matchedAccount.cluster_origin || 1}`, inline: true }
+                    ],
+                    footer: { text: 'MSR Autonomous Edge Agent' },
+                    timestamp: new Date().toISOString()
+                }]
+            });
+        }
+
+        return newFarmingDoc;
+    } catch (err) {
+        console.error('[bootstrap-mongo] Error during autonomous vacant slot auto-fill:', err.message);
+        return null;
+    }
+}
+
+// Autonomous Streak Fatigue Swap with Rested Substitute
+async function executeAutonomousStreakSwap(db, groupId, targetSlot, currentAccount, streak, dataCluster, streakSettings, discordWebhookUrl) {
+    try {
+        const now = Date.now();
+        const restHours = streakSettings.minRestHours || 48;
+        const readyAt = now + restHours * 3600000;
+        const archiveCol = db.collection('streak_archive_accounts');
+
+        // Check prior lifetime vacations
+        let lifetimeVacations = 0;
+        try {
+            const prev = await archiveCol.findOne({ email: new RegExp(`^${escapeRegex(currentAccount.email)}$`, 'i') });
+            if (prev && prev.total_lifetime_vacations) {
+                lifetimeVacations = Number(prev.total_lifetime_vacations);
+            }
+        } catch (_) {}
+
+        // 1. Move fatigued account to streak_archive_accounts
+        const archiveDoc = {
+            email: currentAccount.email,
+            password: currentAccount.password || null,
+            totp_secret: currentAccount.totp_secret || null,
+            recovery_email: currentAccount.recovery_email || null,
+            geo_locale: currentAccount.geo_locale || null,
+            lang_code: currentAccount.lang_code || null,
+            proxy_http: currentAccount.proxy_http || null,
+            proxy_url: currentAccount.proxy_url || null,
+            proxy_port: currentAccount.proxy_port || null,
+            proxy_username: currentAccount.proxy_username || null,
+            proxy_password: currentAccount.proxy_password || null,
+            docker_image: currentAccount.docker_image || null,
+            config_override: currentAccount.config_override || null,
+            dockerfile_override: currentAccount.dockerfile_override || null,
+            script_override: currentAccount.script_override || null,
+            archived_from_group: String(groupId),
+            archived_from_slot: Number(targetSlot),
+            cluster_origin: dataCluster.clusterIndex || 1,
+            archived_at: now,
+            rest_duration_hours_required: restHours,
+            ready_at: readyAt,
+            status: 'RESTING',
+            last_streak_days: streak,
+            total_lifetime_vacations: lifetimeVacations + 1,
+            notes: `Autonomous Fatigue Vacation from Direct MongoDB Boot (${streak} streak days)`
+        };
+
+        await archiveCol.updateOne(
+            { email: currentAccount.email },
+            { $set: archiveDoc },
+            { upsert: true }
+        );
+        console.log(`[bootstrap-mongo] 🌙 Benched fatigued account ${currentAccount.email} (${streak} streak days) for ${restHours}h mandatory rest.`);
+
+        // 2. Search for an eligible rested substitute
+        const eligibleAccounts = await archiveCol.find({
+            email: { $ne: currentAccount.email },
+            $or: [
+                { ready_at: { $lte: now } },
+                { status: 'READY' }
+            ]
+        }).sort({ archived_at: 1 }).toArray();
+
+        let substitute = null;
+        if (eligibleAccounts && eligibleAccounts.length > 0) {
+            const local = eligibleAccounts.find(a => (a.cluster_origin || 1) === dataCluster.clusterIndex);
+            const target = local || eligibleAccounts[0];
+            const claimed = await archiveCol.findOneAndDelete({ _id: target._id });
+            substitute = claimed ? (claimed.value || claimed) : null;
+        }
+
+        // Cross-cluster search if none found in local database
+        if (!substitute) {
+            for (let c = 1; c <= 10; c++) {
+                if (c === dataCluster.clusterIndex) continue;
+                const cKey = `MONGODB_URI_${c}`;
+                const cUri = process.env[cKey];
+                if (!cUri || cUri === 'null') continue;
+
+                let cClient = null;
+                try {
+                    cClient = new MongoClient(cUri, { serverSelectionTimeoutMS: 5000, connectTimeoutMS: 5000 });
+                    await cClient.connect();
+                    const cDb = cClient.db(extractDbName(cUri));
+                    const cCol = cDb.collection('streak_archive_accounts');
+                    const crossEligible = await cCol.find({
+                        email: { $ne: currentAccount.email },
+                        $or: [
+                            { ready_at: { $lte: now } },
+                            { status: 'READY' }
+                        ]
+                    }).sort({ archived_at: 1 }).limit(1).toArray();
+
+                    if (crossEligible && crossEligible.length > 0) {
+                        const claimed = await cCol.findOneAndDelete({ _id: crossEligible[0]._id });
+                        if (claimed) {
+                            substitute = claimed.value || claimed;
+                            await cClient.close();
+                            break;
+                        }
+                    }
+                    await cClient.close();
+                } catch (_) {
+                    if (cClient) { try { await cClient.close(); } catch (_) {} }
+                }
+            }
+        }
+
+        if (substitute && substitute.email) {
+            console.log(`[bootstrap-mongo] 🔄 Found rested bench substitute: ${substitute.email} (Cluster ${substitute.cluster_origin || 1})`);
+
+            const newFarmingDoc = {
+                group_id: String(groupId),
+                slot: Number(targetSlot),
+                email: substitute.email,
+                password: substitute.password || null,
+                totp_secret: substitute.totp_secret || null,
+                recovery_email: substitute.recovery_email || null,
+                geo_locale: substitute.geo_locale || 'auto',
+                lang_code: substitute.lang_code || 'en',
+                proxy_http: substitute.proxy_http || 'false',
+                proxy_url: substitute.proxy_url || null,
+                proxy_port: substitute.proxy_port || null,
+                proxy_username: substitute.proxy_username || null,
+                proxy_password: substitute.proxy_password || null,
+                docker_image: substitute.docker_image || null,
+                config_override: substitute.config_override || null,
+                dockerfile_override: substitute.dockerfile_override || null,
+                script_override: substitute.script_override || null,
+                is_active: 1,
+                last_run: null,
+                last_status: 'Bench Substituted',
+                total_points: 0,
+                updated_at: new Date().toISOString()
+            };
+
+            await db.collection('farming_accounts').updateOne(
+                { group_id: String(groupId), slot: Number(targetSlot) },
+                { $set: newFarmingDoc },
+                { upsert: true }
+            );
+
+            await updateSessionRegistryLocation(substitute.email, groupId, targetSlot);
+
+            if (discordWebhookUrl) {
+                await sendDiscordEmbed(discordWebhookUrl, {
+                    embeds: [{
+                        title: '🔄 Autonomous Streak Swap (Direct Mode)',
+                        description: `Fatigued account benched and successfully replaced with rested substitute in **Group ${groupId} • Slot ${targetSlot}**.`,
+                        color: 0x8b5cf6, // Purple
+                        fields: [
+                            { name: 'Benched Account', value: `\`${currentAccount.email}\` (${streak} streak days)`, inline: false },
+                            { name: 'Injected Substitute', value: `\`${substitute.email}\``, inline: true },
+                            { name: 'Vacation Duration', value: `${restHours} Hours (${Math.round(restHours / 24)} Days)`, inline: true }
+                        ],
+                        footer: { text: 'MSR Autonomous Edge Agent' },
+                        timestamp: new Date().toISOString()
+                    }]
+                });
+            }
+
+            return { substituted: true, account: newFarmingDoc };
+        } else {
+            console.warn(`[bootstrap-mongo] ⚠️ Bench reserve depleted! 0 rested accounts available for substitution.`);
+
+            if (streakSettings.allowEmptySlotsOnFatigue) {
+                console.log(`[bootstrap-mongo] allowEmptySlotsOnFatigue=true. Removing fatigued account and leaving Slot ${targetSlot} vacant.`);
+                await db.collection('farming_accounts').updateOne(
+                    { group_id: String(groupId), slot: Number(targetSlot) },
+                    { $set: { email: '', is_active: 0, last_status: 'Vacation (Bench Exhausted)' } }
+                );
+
+                if (discordWebhookUrl) {
+                    await sendDiscordEmbed(discordWebhookUrl, {
+                        embeds: [{
+                            title: '⚠️ Autonomous Streak Vacation (Bench Depleted)',
+                            description: `Account \`${currentAccount.email}\` (${streak} days) sent to vacation. **Slot ${targetSlot} left empty** because 0 rested substitutes were ready.`,
+                            color: 0xf59e0b, // Amber
+                            footer: { text: 'MSR Autonomous Edge Agent' },
+                            timestamp: new Date().toISOString()
+                        }]
+                    });
+                }
+
+                return { substituted: false, account: null, empty: true };
+            } else {
+                console.log(`[bootstrap-mongo] allowEmptySlotsOnFatigue=false. Preserving active account ${currentAccount.email} as fallback.`);
+                if (discordWebhookUrl) {
+                    await sendDiscordEmbed(discordWebhookUrl, {
+                        embeds: [{
+                            title: '⚠️ Fatigue Warning: Bench Reserves Depleted',
+                            description: `Account \`${currentAccount.email}\` reached **${streak} streak days**, but 0 rested bench accounts are ready. **Preserving account active as fallback.**`,
+                            color: 0xf59e0b,
+                            footer: { text: 'MSR Autonomous Edge Agent' },
+                            timestamp: new Date().toISOString()
+                        }]
+                    });
+                }
+                return { substituted: false, account: currentAccount };
+            }
+        }
+    } catch (err) {
+        console.error('[bootstrap-mongo] Error during autonomous streak swap:', err.message);
+        return { substituted: false, account: currentAccount };
+    }
 }
 
 async function main() {
@@ -220,11 +762,39 @@ async function main() {
             }
             console.log('=====================================================');
 
-            // Query farming_accounts for this group and rotated slot
+            // Query farming_accounts for this group and rotated slot (supporting integer or string slot types)
             account = await db.collection('farming_accounts').findOne({
                 group_id: groupId,
-                slot: targetSlot
+                $or: [{ slot: targetSlot }, { slot: String(targetSlot) }]
             });
+
+            // 2c. Autonomous Edge Streak Guard & Bench Auto-Fill Engine (Direct MongoDB Mode)
+            const streakSettings = await getStreakSettings(db);
+
+            // Gate A: Vacant Slot Auto-Fill from Streak Archive Bench
+            if (!account || !account.email || typeof account.email !== 'string' || account.email.trim() === '') {
+                console.log(`[bootstrap-mongo] 🔍 Slot ${targetSlot} in Group ${groupId} is vacant. Searching Streak Archive for rested accounts...`);
+                const autoFilled = await autoFillVacantSlot(db, groupId, targetSlot, dataCluster, discordWebhookUrl);
+                if (autoFilled) {
+                    account = autoFilled;
+                    console.log(`[bootstrap-mongo] ✅ Auto-filled Slot ${targetSlot} with rested bench account: ${account.email}`);
+                }
+            } else if (streakSettings.autoSubstitutionEnabled) {
+                // Gate B: Occupied Slot Streak Fatigue Check & Substitution
+                const streak = await calculateStreakForAccount(account.email);
+                console.log(`[bootstrap-mongo] 📊 Account ${account.email} current streak: ${streak} days (Threshold: ${streakSettings.maxStreakDays} days)`);
+
+                if (streak >= streakSettings.maxStreakDays) {
+                    console.log(`[bootstrap-mongo] ⚡ Streak fatigue limit reached (${streak} >= ${streakSettings.maxStreakDays} days)! Executing autonomous bench swap...`);
+                    const swapRes = await executeAutonomousStreakSwap(db, groupId, targetSlot, account, streak, dataCluster, streakSettings, discordWebhookUrl);
+                    if (swapRes && swapRes.substituted) {
+                        account = swapRes.account;
+                        console.log(`[bootstrap-mongo] ✅ Successfully substituted fatigued account with rested account: ${account.email}`);
+                    } else if (swapRes && swapRes.empty) {
+                        account = null;
+                    }
+                }
+            }
 
             // Instant disconnect to release socket back to M0 pool immediately
             await client.close();
@@ -258,8 +828,8 @@ async function main() {
         process.exit(0);
     }
 
-    if (!account) {
-        console.warn(`[bootstrap-mongo] ⚠️ No account found in group "${groupId}" for Slot ${targetSlot}.`);
+    if (!account || !account.email || typeof account.email !== 'string' || account.email.trim() === '') {
+        console.warn(`[bootstrap-mongo] ⚠️ No active account configured in group "${groupId}" for Slot ${targetSlot} (slot is vacant or resting).`);
         console.warn('[bootstrap-mongo] Creating a placeholder .env to prevent workflow failure.');
         fs.writeFileSync('.env', '# No account configured for this slot\n');
         fs.writeFileSync('runner_env.json', JSON.stringify({ empty: true, slot: targetSlot }, null, 2));
