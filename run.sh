@@ -54,8 +54,8 @@ fi
 # Therefore, the runner MUST START before 11:30 AM IST to lock in today's authentic
 # shifted slot credentials. If GitHub Actions delays runner boot past 11:30 AM IST,
 # the bootstrapper would fetch TOMORROW's credentials prematurely.
-# If Slot 7 boots at or after 11:30 AM IST, abort immediately and alert Discord.
-if [ "$SLOT" = "7" ]; then
+# If Slot 7, 8, or 9 boots at or after 11:30 AM IST, abort immediately and alert Discord.
+if [ "$SLOT" = "7" ] || [ "$SLOT" = "8" ] || [ "$SLOT" = "9" ]; then
     CURRENT_UTC_H=$(date -u +%H)
     CURRENT_UTC_M=$(date -u +%M)
     TOTAL_UTC_MINS=$(( 10#$CURRENT_UTC_H * 60 + 10#$CURRENT_UTC_M ))
