@@ -128,7 +128,13 @@ async function getStreakSettings(db) {
             if (!isNaN(val) && val >= 12) settings.minRestHours = val;
         }
 
-        const autoDoc = await col.findOne({ key: 'STREAK_AUTO_SUBSTITUTION' });
+        const autoDoc = await col.findOne({
+            $or: [
+                { key: 'STREAK_AUTO_SUBSTITUTION_ENABLED' },
+                { key: 'STREAK_AUTO_SUBSTITUTION' },
+                { key: 'STREAK_AUTO_REINJECT_ENABLED' }
+            ]
+        });
         if (autoDoc && (autoDoc.value === 'false' || autoDoc.value === false)) {
             settings.autoSubstitutionEnabled = false;
         }
@@ -693,7 +699,47 @@ async function main() {
             const OFFSET_MILLIS = 6 * 60 * 60 * 1000;
             const currentDay = Math.floor((Date.now() - OFFSET_MILLIS) / 86400000);
 
-            if (executionMode === '1_DAY_GAP' && slot >= 7 && slot <= 9) {
+            let isExperimentalSlot = false;
+            let experimentalTeam = '';
+            let isGapModeSlot = false;
+            let gapBankName = '';
+
+            if (executionMode === '1_DAY_GAP') {
+                if (slot >= 1 && slot <= 6) {
+                    isGapModeSlot = true;
+                    const isBankB = (currentDay % 2 === 1);
+                    const bankOffset = isBankB ? 6 : 0;
+                    gapBankName = isBankB ? 'Bank B (Slots 7–12)' : 'Bank A (Slots 1–6)';
+                    currentOffset = rotationEnabled ? (currentDay % 6) : 0;
+                    targetSlot = (((slot - 1 + currentOffset) % 6) + 1) + bankOffset;
+                } else {
+                    // Runners > 6 are dormant in 1_DAY_GAP mode (full pod operates via Runners 1–6 across 12 slots)
+                    console.warn(`[bootstrap-mongo] ⚠️ Runner assigned Slot ${slot} is dormant in 1_DAY_GAP mode (full pod operates via Runners 1–6 across 12 slots).`);
+                    console.warn('[bootstrap-mongo] Slot is dormant/inactive. Creating placeholder and exiting safely.');
+                    await client.close();
+                    fs.writeFileSync('.env', '# Slot dormant/inactive in 1_DAY_GAP mode\n');
+                    fs.writeFileSync('runner_env.json', JSON.stringify({ inactive: true, slot, reason: 'slot_dormant_in_1_day_gap' }, null, 2));
+                    process.exit(0);
+                }
+            } else if (executionMode === '2_DAY_GAP') {
+                if (slot >= 1 && slot <= 6) {
+                    isGapModeSlot = true;
+                    const bankIndex = currentDay % 3; // 0 = Bank A, 1 = Bank B, 2 = Bank C
+                    const bankOffset = bankIndex * 6;
+                    const bankNames = ['Bank A (Slots 1–6)', 'Bank B (Slots 7–12)', 'Bank C (Slots 13–18)'];
+                    gapBankName = bankNames[bankIndex];
+                    currentOffset = rotationEnabled ? (currentDay % 6) : 0;
+                    targetSlot = (((slot - 1 + currentOffset) % 6) + 1) + bankOffset;
+                } else {
+                    // Runners > 6 are dormant in 2_DAY_GAP mode (full pod operates via Runners 1–6 across 18 slots)
+                    console.warn(`[bootstrap-mongo] ⚠️ Runner assigned Slot ${slot} is dormant in 2_DAY_GAP mode (full pod operates via Runners 1–6 across 18 slots).`);
+                    console.warn('[bootstrap-mongo] Slot is dormant/inactive. Creating placeholder and exiting safely.');
+                    await client.close();
+                    fs.writeFileSync('.env', '# Slot dormant/inactive in 2_DAY_GAP mode\n');
+                    fs.writeFileSync('runner_env.json', JSON.stringify({ inactive: true, slot, reason: 'slot_dormant_in_2_day_gap' }, null, 2));
+                    process.exit(0);
+                }
+            } else if ((executionMode === 'EXP_1_DAY_GAP' || executionMode === '1_DAY_GAP_EXP') && slot >= 7 && slot <= 9) {
                 // Mode 1: Experimental Circular 1-Day Gap Subsystem (12-Slot Ping-Pong with 48h rest)
                 // Team A: Slots 7, 8, 9 (base: 7)
                 // Team B: Slots 10, 11, 12 (base: 10)
@@ -706,7 +752,15 @@ async function main() {
                 const baseSlot = isTeamBActive ? 10 : 7;
                 targetSlot = baseSlot + ((runnerIdx + cycleShift) % 3);
                 currentOffset = 0; // Decoupled from main sequential cron rotation
-            } else if (executionMode === '3_DAY_ROTATION' && slot >= 7 && slot <= 9) {
+            } else if ((executionMode === 'EXP_1_DAY_GAP' || executionMode === '1_DAY_GAP_EXP') && slot >= 10) {
+                // In EXP_1_DAY_GAP mode, Slots 10+ are bypassed for direct runner execution
+                console.warn(`[bootstrap-mongo] ⚠️ Runner assigned Slot ${slot} is bypassed in EXP_1_DAY_GAP mode (virtualized across Repos 7–9).`);
+                console.warn('[bootstrap-mongo] Slot is dormant/inactive. Creating placeholder and exiting safely.');
+                await client.close();
+                fs.writeFileSync('.env', '# Slot dormant/inactive in EXP_1_DAY_GAP mode\n');
+                fs.writeFileSync('runner_env.json', JSON.stringify({ inactive: true, slot, reason: 'slot_bypassed_in_exp_1_day_gap' }, null, 2));
+                process.exit(0);
+            } else if ((executionMode === 'EXP_3_DAY_ROTATION' || executionMode === '3_DAY_ROTATION') && slot >= 7 && slot <= 9) {
                 // Mode 2: Experimental 3-Day Rotation Subsystem (Slots 7–9 Only)
                 // Slots 7, 8, 9 cycle circularly across repo_7, repo_8, repo_9 every 3 days. Slots 10–12 bypassed.
                 isExperimentalSlot = true;
@@ -715,7 +769,7 @@ async function main() {
                 targetSlot = 7 + ((runnerIdx + offset) % 3);
                 experimentalTeam = `3-Day Cycle (Offset +${offset})`;
                 currentOffset = 0;
-            } else if (executionMode === '3_DAY_ROTATION' && slot >= 10) {
+            } else if ((executionMode === 'EXP_3_DAY_ROTATION' || executionMode === '3_DAY_ROTATION') && slot >= 10) {
                 // In 3-Day Rotation mode, Slots 10, 11, 12 are strictly dormant and bypassed
                 console.warn(`[bootstrap-mongo] ⚠️ Runner assigned Slot ${slot} is bypassed in 3-Day Rotation mode (only Slots 7–9 are active).`);
                 console.warn('[bootstrap-mongo] Slot is dormant/inactive. Creating placeholder and exiting safely.');
@@ -747,11 +801,15 @@ async function main() {
             console.log(`  Runner Assigned Slot : SLOT ${slot}`);
             console.log(`  Rotation Capacity    : ${numSlots} Slots (${remoteSlots ? 'Atlas Synced' : 'Env Fallback'})`);
             console.log(`  Group Execution Mode : ${executionMode}`);
-            if (isExperimentalSlot) {
-                if (executionMode === '1_DAY_GAP') {
+            if (isGapModeSlot) {
+                console.log(`  Subsystem Mode       : ⚡ Full-Pod Gap Mode (${gapBankName})`);
+                console.log(`  Daily Rotation Offset: +${currentOffset} (${rotationEnabled ? 'ENABLED' : 'DISABLED'})`);
+                console.log(`  Target Account Slot  : SLOT ${targetSlot}`);
+            } else if (isExperimentalSlot) {
+                if (executionMode === 'EXP_1_DAY_GAP' || executionMode === '1_DAY_GAP_EXP') {
                     const cycleShift = Math.floor(currentDay / 2) % 3;
                     console.log(`  Subsystem Mode       : 🧪 Experimental 1-Day Gap (${experimentalTeam}, Shift +${cycleShift})`);
-                } else if (executionMode === '3_DAY_ROTATION') {
+                } else if (executionMode === 'EXP_3_DAY_ROTATION' || executionMode === '3_DAY_ROTATION') {
                     const offset = currentDay % 3;
                     console.log(`  Subsystem Mode       : 🧪 Experimental 3-Day Rotation (Offset +${offset})`);
                 }
@@ -773,25 +831,34 @@ async function main() {
 
             // Gate A: Vacant Slot Auto-Fill from Streak Archive Bench
             if (!account || !account.email || typeof account.email !== 'string' || account.email.trim() === '') {
-                console.log(`[bootstrap-mongo] 🔍 Slot ${targetSlot} in Group ${groupId} is vacant. Searching Streak Archive for rested accounts...`);
-                const autoFilled = await autoFillVacantSlot(db, groupId, targetSlot, dataCluster, discordWebhookUrl);
-                if (autoFilled) {
-                    account = autoFilled;
-                    console.log(`[bootstrap-mongo] ✅ Auto-filled Slot ${targetSlot} with rested bench account: ${account.email}`);
+                if (!streakSettings.autoSubstitutionEnabled) {
+                    console.log(`[bootstrap-mongo] ⏸️ Autonomous vacant slot auto-fill is currently PAUSED by operator (STREAK_AUTO_SUBSTITUTION_ENABLED=false). Slot ${targetSlot} remains empty.`);
+                } else {
+                    console.log(`[bootstrap-mongo] 🔍 Slot ${targetSlot} in Group ${groupId} is vacant. Searching Streak Archive for rested accounts...`);
+                    const autoFilled = await autoFillVacantSlot(db, groupId, targetSlot, dataCluster, discordWebhookUrl);
+                    if (autoFilled) {
+                        account = autoFilled;
+                        console.log(`[bootstrap-mongo] ✅ Auto-filled Slot ${targetSlot} with rested bench account: ${account.email}`);
+                    }
                 }
             } else if (streakSettings.autoSubstitutionEnabled) {
                 // Gate B: Occupied Slot Streak Fatigue Check & Substitution
-                const streak = await calculateStreakForAccount(account.email);
-                console.log(`[bootstrap-mongo] 📊 Account ${account.email} current streak: ${streak} days (Threshold: ${streakSettings.maxStreakDays} days)`);
+                const isGroupLocked = Boolean(group && (group.is_locked === 1 || group.is_locked === true));
+                if (isGroupLocked) {
+                    console.log(`[bootstrap-mongo] 🔒 Group ${groupId} is LOCKED against streak vacation. Autonomous fatigue substitution skipped for this group.`);
+                } else {
+                    const streak = await calculateStreakForAccount(account.email);
+                    console.log(`[bootstrap-mongo] 📊 Account ${account.email} current streak: ${streak} days (Threshold: ${streakSettings.maxStreakDays} days)`);
 
-                if (streak >= streakSettings.maxStreakDays) {
-                    console.log(`[bootstrap-mongo] ⚡ Streak fatigue limit reached (${streak} >= ${streakSettings.maxStreakDays} days)! Executing autonomous bench swap...`);
-                    const swapRes = await executeAutonomousStreakSwap(db, groupId, targetSlot, account, streak, dataCluster, streakSettings, discordWebhookUrl);
-                    if (swapRes && swapRes.substituted) {
-                        account = swapRes.account;
-                        console.log(`[bootstrap-mongo] ✅ Successfully substituted fatigued account with rested account: ${account.email}`);
-                    } else if (swapRes && swapRes.empty) {
-                        account = null;
+                    if (streak >= streakSettings.maxStreakDays) {
+                        console.log(`[bootstrap-mongo] ⚡ Streak fatigue limit reached (${streak} >= ${streakSettings.maxStreakDays} days)! Executing autonomous bench swap...`);
+                        const swapRes = await executeAutonomousStreakSwap(db, groupId, targetSlot, account, streak, dataCluster, streakSettings, discordWebhookUrl);
+                        if (swapRes && swapRes.substituted) {
+                            account = swapRes.account;
+                            console.log(`[bootstrap-mongo] ✅ Successfully substituted fatigued account with rested account: ${account.email}`);
+                        } else if (swapRes && swapRes.empty) {
+                            account = null;
+                        }
                     }
                 }
             }
