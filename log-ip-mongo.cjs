@@ -101,6 +101,17 @@ async function main() {
     const runnerOrg = process.argv[6] || 'Unknown';
     const rawSlot = process.argv[7] || '1';
     const slot = parseInt(rawSlot, 10) || 1;
+    let effectiveSlot = slot;
+
+    // Resolve accurate target slot from runner_env.json in rotated/gap modes
+    if (fs.existsSync('runner_env.json')) {
+        try {
+            const runnerEnv = JSON.parse(fs.readFileSync('runner_env.json', 'utf8'));
+            if (runnerEnv.target_slot && !isNaN(parseInt(runnerEnv.target_slot, 10))) {
+                effectiveSlot = parseInt(runnerEnv.target_slot, 10);
+            }
+        } catch (_) {}
+    }
 
     if (!runnerIp || runnerIp.trim() === '') {
         console.log('[log-ip-mongo] No IP provided. Skipping IP telemetry.');
@@ -129,7 +140,7 @@ async function main() {
         ip: runnerIp.trim(),
         email: accountEmail.trim(),
         group_id: String(groupId).trim(),
-        slot,
+        slot: effectiveSlot,
         country: String(runnerCountry).trim().toUpperCase(),
         region: String(runnerRegion).trim(),
         city: String(runnerCity).trim(),
