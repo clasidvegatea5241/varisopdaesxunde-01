@@ -156,6 +156,18 @@ async function migratePriorDailyHistoryIfAny(cleanEmail, fromClusterIndex, toClu
 
 async function main() {
     const rawSlot = process.argv[2] || '1';
+    let effectiveSlot = parseInt(rawSlot, 10) || 1;
+
+    // Resolve accurate target slot from runner_env.json in rotated/gap modes
+    if (fs.existsSync('runner_env.json')) {
+        try {
+            const runnerEnv = JSON.parse(fs.readFileSync('runner_env.json', 'utf8'));
+            if (runnerEnv.target_slot && !isNaN(parseInt(runnerEnv.target_slot, 10))) {
+                effectiveSlot = parseInt(runnerEnv.target_slot, 10);
+            }
+        } catch (_) {}
+    }
+
     const groupId = process.env.GROUP_ID || '001';
     const dataCluster = resolveMongoUri(groupId, 'data');
     const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL || null;
@@ -233,6 +245,7 @@ async function main() {
     console.log('=====================================================');
     console.log('  Dual-Mode Post-Run Telemetry');
     console.log(`  Account Email     : ${accountEmail}`);
+    console.log(`  Target Slot       : Slot ${effectiveSlot}${effectiveSlot !== parseInt(rawSlot, 10) ? ` (via Runner ${rawSlot})` : ''}`);
     console.log(`  Cluster Partition : Cluster ${dataCluster.clusterIndex} (via ${dataCluster.source})`);
     console.log(`  Execution Status  : ${status}`);
     if (currentBalance !== null) {
@@ -366,7 +379,7 @@ async function main() {
                     status: status,
                     duration_minutes: numericDuration,
                     group_id: String(groupId).padStart(3, '0'),
-                    slot: parseInt(rawSlot, 10) || 1,
+                    slot: effectiveSlot,
                     cluster_index: dataCluster.clusterIndex || 1,
                     timestamp: new Date().toISOString(),
                     created_at: Date.now()
@@ -444,11 +457,12 @@ async function main() {
     // 4. Send Fallback Discord Notification If Bot Exited Non-Zero
     if (discordWebhookUrl && status !== 'Finished') {
         const color = status === 'Suspended' || status === 'Locked' ? 0xff0000 : 0xffaa00;
+        const slotDesc = effectiveSlot !== parseInt(rawSlot, 10) ? `Slot ${effectiveSlot} • via Runner ${rawSlot}` : `Slot ${effectiveSlot}`;
         const embedPayload = {
             embeds: [
                 {
                     title: `⚠️ Account Alert: ${accountEmail}`,
-                    description: `Farming completed with status **${status}** (Slot ${rawSlot})`,
+                    description: `Farming completed with status **${status}** (${slotDesc})`,
                     color: color,
                     fields: [
                         { name: 'Status', value: status, inline: true },
