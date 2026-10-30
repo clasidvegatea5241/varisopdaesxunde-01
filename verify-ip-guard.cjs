@@ -322,6 +322,17 @@ async function main() {
     const runnerOrg = (process.argv[6] || 'Unknown').trim();
     const rawSlot = process.argv[7] || '1';
     const slot = parseInt(rawSlot, 10) || 1;
+    let effectiveSlot = slot;
+
+    // Resolve accurate target slot from runner_env.json in rotated/gap modes
+    if (fs.existsSync('runner_env.json')) {
+        try {
+            const runnerEnv = JSON.parse(fs.readFileSync('runner_env.json', 'utf8'));
+            if (runnerEnv.target_slot && !isNaN(parseInt(runnerEnv.target_slot, 10))) {
+                effectiveSlot = parseInt(runnerEnv.target_slot, 10);
+            }
+        } catch (_) {}
+    }
 
     if (!runnerIp) {
         console.warn('[verify-ip-guard] No IP provided to verify. Failing open.');
@@ -467,7 +478,7 @@ async function main() {
         ip: runnerIp,
         email: accountEmail,
         group_id: String(groupId).trim(),
-        slot: slot,
+        slot: effectiveSlot,
         country: String(runnerCountry).trim().toUpperCase(),
         region: String(runnerRegion).trim(),
         city: String(runnerCity).trim(),
@@ -491,7 +502,8 @@ async function main() {
             ip: runnerIp,
             email: accountEmail,
             group_id: groupId,
-            slot: slot,
+            slot: effectiveSlot,
+            runner_slot: slot,
             rotation_date: rotationDate,
             fleet_daily_count: newFleetRunCount,
             home_cluster: homeCluster.source,
