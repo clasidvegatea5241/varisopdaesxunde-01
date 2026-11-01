@@ -124,6 +124,12 @@ jobs:
               echo "ACCOUNT_1_PROXY_PASSWORD=$(jq -r .proxy_password_1 runner_env.json)" >> .env
               echo "ACCOUNT_1_SAVE_FINGERPRINT_MOBILE=$(jq -r .save_fingerprint_mobile_1 runner_env.json)" >> .env
               echo "ACCOUNT_1_SAVE_FINGERPRINT_DESKTOP=$(jq -r .save_fingerprint_desktop_1 runner_env.json)" >> .env
+              USE_WARP=$(jq -r '.use_cloudflare_warp_1 // false' runner_env.json)
+              if [ "$USE_WARP" = "true" ]; then
+                echo "USE_CLOUDFLARE_WARP=true" >> .env
+              else
+                echo "USE_CLOUDFLARE_WARP=false" >> .env
+              fi
               MONGO_URI=$(jq -r .session_mongodb_uri runner_env.json)
               if [ "$MONGO_URI" != "null" ] && [ -n "$MONGO_URI" ]; then
                  echo "SESSION_MONGODB_URI=$MONGO_URI" >> .env
@@ -139,6 +145,38 @@ jobs:
               echo "========================================="
               echo "Successfully generated .env file from Matrix DB!"
             fi
+          fi
+
+      - name: "Optional Cloudflare WARP Initialization"
+        run: |
+          if [ -f .env ] && grep -q "USE_CLOUDFLARE_WARP=true" .env 2>/dev/null; then
+            echo "🌐 Cloudflare WARP requested for this runner. Initializing WARP client on host..."
+            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo "$VERSION_CODENAME") main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cloudflare-warp
+            sudo warp-cli --accept-tos registration new 2>/dev/null || true
+            sudo warp-cli --accept-tos mode proxy 2>/dev/null || true
+            sudo warp-cli --accept-tos proxy port 40000 2>/dev/null || true
+            sudo warp-cli --accept-tos connect 2>/dev/null || true
+
+            WARP_HEALTHY=false
+            for i in 1 2 3 4 5; do
+              if curl --socks5-hostname 127.0.0.1:40000 -s --max-time 3 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+                WARP_HEALTHY=true
+                break
+              fi
+              sleep 1.5
+            done
+
+            if [ "$WARP_HEALTHY" = "true" ]; then
+              echo "✅ Host Cloudflare WARP SOCKS5 active on 127.0.0.1:40000!"
+            else
+              echo "⚠️ Host Cloudflare WARP handshake check failed. Zero Account Loss Fallback: Unsetting proxy."
+              sed -i '/ACCOUNT_1_PROXY/d' .env 2>/dev/null || true
+              sed -i '/USE_CLOUDFLARE_WARP/d' .env 2>/dev/null || true
+            fi
+          else
+            echo "[-] Cloudflare WARP not enabled for this slot. Skipping."
           fi
 
       - name: Run Farm (V4)
