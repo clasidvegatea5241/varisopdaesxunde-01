@@ -137,16 +137,22 @@ fi
 # Execution Gate: Region Guard (US IP Verification)
 # =========================================================
 ACCOUNT_PROXY_URL=$(grep -E '^ACCOUNT_1_PROXY_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
+ACCOUNT_PROXY_PORT=$(grep -E '^ACCOUNT_1_PROXY_PORT=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
 
 if [ -n "$ACCOUNT_PROXY_URL" ] && [ "$ACCOUNT_PROXY_URL" != "null" ]; then
+    FULL_PROXY_URL="$ACCOUNT_PROXY_URL"
+    if [ -n "$ACCOUNT_PROXY_PORT" ] && [ "$ACCOUNT_PROXY_PORT" != "null" ] && ! echo "$ACCOUNT_PROXY_URL" | grep -qE ':[0-9]+$'; then
+        FULL_PROXY_URL="${ACCOUNT_PROXY_URL}:${ACCOUNT_PROXY_PORT}"
+    fi
+
     echo "========================================================="
     echo " [Region Guard] Account configured with dedicated proxy:"
-    echo "                 URL: $ACCOUNT_PROXY_URL"
+    echo "                 URL: $FULL_PROXY_URL"
     echo "                 Browser traffic will route through proxy."
     echo "                 Host runner IP check bypassed."
     echo "========================================================="
     # Resolve proxy egress IP for telemetry logging
-    PROXY_DATA=$(curl -s -x "$ACCOUNT_PROXY_URL" --connect-timeout 4 --max-time 8 https://ipinfo.io/json 2>/dev/null || echo "")
+    PROXY_DATA=$(curl -s -x "$FULL_PROXY_URL" --connect-timeout 4 --max-time 8 https://ipinfo.io/json 2>/dev/null || echo "")
     if [ -n "$PROXY_DATA" ]; then
         RUNNER_IP=$(echo "$PROXY_DATA" | jq -r '.ip // empty' 2>/dev/null || echo "")
         RUNNER_COUNTRY=$(echo "$PROXY_DATA" | jq -r '.country // "US"' 2>/dev/null || echo "US")
@@ -507,13 +513,45 @@ run_container() {
         echo "$CONFIG_OVERRIDE" > config/config.json
         echo "[!] Applied custom config.json override from MSR-Database."
     else
-        echo "[-] Using default config settings. (Mounted empty config dir to prevent crash)"
+        echo "[-] Using default config settings from runner template."
+        if [ -f runner_templates/config.json ]; then
+            cp runner_templates/config.json config/config.json
+        fi
     fi
     VOLUME_MOUNT="-v $(pwd)/config:/usr/src/microsoft-rewards-script/config"
+
+    WARP_NETWORK_ARG=""
+    if grep -q "USE_CLOUDFLARE_WARP=true" .env 2>/dev/null; then
+        echo "[run.sh] 🌐 Cloudflare WARP is enabled: binding container with --net=host to access host SOCKS5 proxy."
+        WARP_NETWORK_ARG="--net=host"
+    fi
+
+    # Inspect active config.json for informational runner logging
+    if [ -f config/config.json ]; then
+        CONFIG_HEADLESS_VAL=$(jq -r '.headless // empty' config/config.json 2>/dev/null || echo "")
+        if [ "$CONFIG_HEADLESS_VAL" = "false" ]; then
+            echo "[run.sh] 🖥️ 'headless: false' detected in config.json -> Container will run in Virtual 1080p Headed Mode (XVFB)."
+        else
+            echo "[run.sh] 🕶️ 'headless: true' detected in config.json -> Container will run in standard Headless Mode."
+        fi
+    fi
+
+    # Check for Live Web-VNC flag
+    if [ -f runner_env.json ]; then
+        VNC_FROM_RUNNER=$(jq -r '.enable_live_vnc // empty' runner_env.json 2>/dev/null || echo "")
+        if [ "$VNC_FROM_RUNNER" = "true" ]; then
+            ENABLE_LIVE_VNC="true"
+        fi
+    fi
+    if [ "${ENABLE_LIVE_VNC:-false}" = "true" ] || grep -q "ENABLE_LIVE_VNC=true" .env 2>/dev/null; then
+        echo "[run.sh] 📺 On-Demand Live Web-VNC Observation is ENABLED for this slot."
+        ENABLE_LIVE_VNC="true"
+    fi
 
     # Run container in detached mode (Passing .env so the container gets the Bootstrapper variables)
     CONTAINER_ID=$(docker run -d \
       --shm-size=4g \
+      $WARP_NETWORK_ARG \
       -e MIN_SLEEP_MINUTES=15 \
       -e MAX_SLEEP_MINUTES=50 \
       -e SKIP_RANDOM_SLEEP=true \
@@ -522,6 +560,7 @@ run_container() {
       -e GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}" \
       -e GROUP_ID="${GROUP_ID:-}" \
       -e SLOT="${SLOT:-}" \
+      -e ENABLE_LIVE_VNC="${ENABLE_LIVE_VNC:-false}" \
       --env-file .env \
       $VOLUME_MOUNT \
       $FINAL_IMAGE)
@@ -568,7 +607,7 @@ if [ "$DOCKER_OVERRIDE" != "null" ] && [ -n "$DOCKER_OVERRIDE" ]; then
     fi
 else
     echo "[-] Using default Docker image."
-    FINAL_IMAGE="ghcr.io/thenetsky/microsoft-rewards-script:4"
+    FINAL_IMAGE="ghcr.io/tvkk0539/netsky-new-v5-custom:latest"
     SHOULD_BUILD=false
 fi
 
