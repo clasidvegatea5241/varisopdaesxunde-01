@@ -71,6 +71,28 @@ function escapeRegex(str) {
     return String(str).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * Resolves the effective IP routing policy for an account within a pod group.
+ * Hierarchy:
+ * 1. Slot Custom Proxy: If proxy_url is set, returns CUSTOM_PROXY
+ * 2. Slot Explicit Setting: If ip_routing is DEFAULT, CLOUDFLARE_WARP, or CUSTOM_PROXY
+ * 3. Group Setting: If slot is INHERIT, falls back to group ip_routing (CLOUDFLARE_WARP or DEFAULT)
+ * 4. Fallback Default: Returns DEFAULT (Direct GitHub Action Runner IP)
+ */
+function resolveEffectiveIpRouting(groupData, accountData) {
+    if (accountData?.proxy_url && typeof accountData.proxy_url === 'string' && accountData.proxy_url.trim() !== '') {
+        return 'CUSTOM_PROXY';
+    }
+    const accRouting = (accountData?.ip_routing || 'INHERIT').trim().toUpperCase();
+    if (accRouting === 'CUSTOM_PROXY') return 'CUSTOM_PROXY';
+    if (accRouting === 'CLOUDFLARE_WARP') return 'CLOUDFLARE_WARP';
+    if (accRouting === 'DEFAULT') return 'DEFAULT';
+
+    const grpRouting = (groupData?.ip_routing || 'DEFAULT').trim().toUpperCase();
+    if (grpRouting === 'CLOUDFLARE_WARP') return 'CLOUDFLARE_WARP';
+    return 'DEFAULT';
+}
+
 // Helper to send Discord webhook embed natively
 function sendDiscordEmbed(webhookUrl, payload) {
     if (!webhookUrl || webhookUrl === 'null' || typeof webhookUrl !== 'string') return Promise.resolve();
@@ -911,6 +933,9 @@ async function main() {
     }
 
     // 5. Generate .env File (Formatting as ACCOUNT_1_* so bot treats it as primary)
+    const effectiveRouting = resolveEffectiveIpRouting(group, account);
+    console.log(`[bootstrap-mongo] 🌐 Resolved IP Routing: ${effectiveRouting} (Group: ${group?.ip_routing || 'DEFAULT'}, Slot: ${account?.ip_routing || 'INHERIT'})`);
+
     const envLines = [];
     envLines.push(`ACCOUNT_1_EMAIL=${account.email || ''}`);
     envLines.push(`ACCOUNT_1_PASSWORD=${account.password || ''}`);
@@ -918,11 +943,31 @@ async function main() {
     envLines.push(`ACCOUNT_1_RECOVERY_EMAIL=${account.recovery_email || ''}`);
     envLines.push(`ACCOUNT_1_GEO_LOCALE=${account.geo_locale || 'auto'}`);
     envLines.push(`ACCOUNT_1_LANG_CODE=${account.lang_code || 'en'}`);
-    envLines.push(`ACCOUNT_1_PROXY_HTTP=${account.proxy_http || 'false'}`);
-    envLines.push(`ACCOUNT_1_PROXY_URL=${account.proxy_url || ''}`);
-    envLines.push(`ACCOUNT_1_PROXY_PORT=${account.proxy_port !== null && account.proxy_port !== undefined ? account.proxy_port : ''}`);
-    envLines.push(`ACCOUNT_1_PROXY_USERNAME=${account.proxy_username || ''}`);
-    envLines.push(`ACCOUNT_1_PROXY_PASSWORD=${account.proxy_password || ''}`);
+
+    if (effectiveRouting === 'CLOUDFLARE_WARP') {
+        envLines.push('USE_CLOUDFLARE_WARP=true');
+        envLines.push('ACCOUNT_1_PROXY_HTTP=false');
+        envLines.push('ACCOUNT_1_PROXY_URL=socks5://127.0.0.1');
+        envLines.push('ACCOUNT_1_PROXY_PORT=40000');
+        envLines.push('ACCOUNT_1_PROXY_USERNAME=');
+        envLines.push('ACCOUNT_1_PROXY_PASSWORD=');
+    } else if (effectiveRouting === 'CUSTOM_PROXY') {
+        envLines.push('USE_CLOUDFLARE_WARP=false');
+        envLines.push(`ACCOUNT_1_PROXY_HTTP=${account.proxy_http || 'false'}`);
+        envLines.push(`ACCOUNT_1_PROXY_URL=${account.proxy_url || ''}`);
+        envLines.push(`ACCOUNT_1_PROXY_PORT=${account.proxy_port !== null && account.proxy_port !== undefined ? account.proxy_port : ''}`);
+        envLines.push(`ACCOUNT_1_PROXY_USERNAME=${account.proxy_username || ''}`);
+        envLines.push(`ACCOUNT_1_PROXY_PASSWORD=${account.proxy_password || ''}`);
+    } else {
+        // DEFAULT: Direct GitHub Action runner IP
+        envLines.push('USE_CLOUDFLARE_WARP=false');
+        envLines.push('ACCOUNT_1_PROXY_HTTP=false');
+        envLines.push('ACCOUNT_1_PROXY_URL=');
+        envLines.push('ACCOUNT_1_PROXY_PORT=');
+        envLines.push('ACCOUNT_1_PROXY_USERNAME=');
+        envLines.push('ACCOUNT_1_PROXY_PASSWORD=');
+    }
+
     envLines.push(`ACCOUNT_1_SAVE_FINGERPRINT_MOBILE=${account.save_fingerprint_mobile || '0'}`);
     envLines.push(`ACCOUNT_1_SAVE_FINGERPRINT_DESKTOP=${account.save_fingerprint_desktop || '0'}`);
 
@@ -935,6 +980,15 @@ async function main() {
     if (discordWebhookUrl && discordWebhookUrl !== 'null') {
         envLines.push(`CONFIG_DISCORD_ENABLED=true`);
         envLines.push(`CONFIG_DISCORD_URL=${discordWebhookUrl}`);
+    }
+
+    // Optional Live Web-VNC Observation (via Cloudflare Quick Tunnel)
+    const enableLiveVnc = Boolean(account.enable_live_vnc || group?.enable_live_vnc);
+    if (enableLiveVnc) {
+        envLines.push('ENABLE_LIVE_VNC=true');
+        console.log('[bootstrap-mongo] 🖥️ Live Web-VNC Observation enabled for this slot.');
+    } else {
+        envLines.push('ENABLE_LIVE_VNC=false');
     }
 
     fs.writeFileSync('.env', envLines.join('\n') + '\n');
@@ -952,9 +1006,14 @@ async function main() {
         target_slot: targetSlot,
         experimental_mode: isExperimentalSlot,
         experimental_team: experimentalTeam,
+        ip_routing: effectiveRouting,
+        use_cloudflare_warp: effectiveRouting === 'CLOUDFLARE_WARP',
+        enable_live_vnc: enableLiveVnc,
         [`account_${slot}`]: account.email,
         [`docker_override_${slot}`]: dockerOverride,
-        [`config_override_${slot}`]: configOverride
+        [`config_override_${slot}`]: configOverride,
+        [`use_cloudflare_warp_${slot}`]: effectiveRouting === 'CLOUDFLARE_WARP',
+        [`enable_live_vnc_${slot}`]: enableLiveVnc
     };
 
     fs.writeFileSync('runner_env.json', JSON.stringify(runnerEnvPayload, null, 2));
