@@ -563,7 +563,8 @@ run_container() {
       -e ENABLE_LIVE_VNC="${ENABLE_LIVE_VNC:-false}" \
       --env-file .env \
       $VOLUME_MOUNT \
-      $FINAL_IMAGE)
+      $FINAL_IMAGE \
+      /bin/bash /usr/src/microsoft-rewards-script/scripts/docker/run_daily.sh)
 
     echo "Container started with ID: $CONTAINER_ID"
 
