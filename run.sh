@@ -526,27 +526,49 @@ run_container() {
         WARP_NETWORK_ARG="--net=host"
     fi
 
-    # Inspect active config.json for informational runner logging
+    # 1. Inspect active config.json for headless preference
+    CONFIG_HEADLESS_VAL="true"
     if [ -f config/config.json ]; then
-        CONFIG_HEADLESS_VAL=$(jq -r '.headless // empty' config/config.json 2>/dev/null || echo "")
+        CONFIG_HEADLESS_VAL=$(jq -r 'if .headless != null then .headless else "true" end' config/config.json 2>/dev/null || echo "true")
+    fi
+
+    # 2. Extract account-anchored VNC preference from .env or runner_env.json
+    RAW_VNC_PREF=""
+    if [ -f .env ]; then
+        RAW_VNC_PREF=$(grep -E '^ENABLE_LIVE_VNC=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
+    fi
+    if [ -z "$RAW_VNC_PREF" ] && [ -f runner_env.json ]; then
+        RAW_VNC_PREF=$(jq -r ".enable_live_vnc_${SLOT} // .enable_live_vnc // empty" runner_env.json 2>/dev/null || echo "")
+    fi
+    [ -z "$RAW_VNC_PREF" ] && RAW_VNC_PREF="auto"
+
+    # 3. Resolve final VNC state
+    FINAL_ENABLE_LIVE_VNC="false"
+    if [ "$RAW_VNC_PREF" = "disabled" ] || [ "$RAW_VNC_PREF" = "false" ]; then
+        FINAL_ENABLE_LIVE_VNC="false"
         if [ "$CONFIG_HEADLESS_VAL" = "false" ]; then
-            echo "[run.sh] 🖥️ 'headless: false' detected in config.json -> Container will run in Virtual 1080p Headed Mode (XVFB)."
+            echo "[run.sh] 🚫 Live Web-VNC is explicitly DISABLED for this account."
+            echo "[run.sh] 🖥️ Running in Pure Virtual Headed Mode (XVFB) without VNC tunnel (like v4)."
         else
-            echo "[run.sh] 🕶️ 'headless: true' detected in config.json -> Container will run in standard Headless Mode."
+            echo "[run.sh] 🕶️ Standard Headless Mode active (VNC disabled)."
+        fi
+    elif [ "$RAW_VNC_PREF" = "enabled" ] || [ "$RAW_VNC_PREF" = "true" ]; then
+        FINAL_ENABLE_LIVE_VNC="true"
+        echo "[run.sh] 📺 On-Demand Live Web-VNC Observation is FORCED ENABLED for this account."
+    else
+        # 'auto' mode: Follow config.json headless setting
+        if [ "$CONFIG_HEADLESS_VAL" = "false" ]; then
+            FINAL_ENABLE_LIVE_VNC="true"
+            echo "[run.sh] 🖥️ 'headless: false' detected in config.json + auto VNC mode -> Live Web-VNC enabled."
+        else
+            FINAL_ENABLE_LIVE_VNC="false"
+            echo "[run.sh] 🕶️ 'headless: true' detected in config.json -> Standard Headless Mode active."
         fi
     fi
 
-    # Check for Live Web-VNC flag
-    if [ -f runner_env.json ]; then
-        VNC_FROM_RUNNER=$(jq -r '.enable_live_vnc // empty' runner_env.json 2>/dev/null || echo "")
-        if [ "$VNC_FROM_RUNNER" = "true" ]; then
-            ENABLE_LIVE_VNC="true"
-        fi
-    fi
-    if [ "${ENABLE_LIVE_VNC:-false}" = "true" ] || grep -q "ENABLE_LIVE_VNC=true" .env 2>/dev/null; then
-        echo "[run.sh] 📺 On-Demand Live Web-VNC Observation is ENABLED for this slot."
-        ENABLE_LIVE_VNC="true"
-    fi
+    # Sync into .env so container receives clean boolean
+    sed -i '/^ENABLE_LIVE_VNC=/d' .env 2>/dev/null || true
+    echo "ENABLE_LIVE_VNC=${FINAL_ENABLE_LIVE_VNC}" >> .env
 
     # Run container in detached mode (Passing .env so the container gets the Bootstrapper variables)
     CONTAINER_ID=$(docker run -d \
@@ -560,7 +582,7 @@ run_container() {
       -e GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}" \
       -e GROUP_ID="${GROUP_ID:-}" \
       -e SLOT="${SLOT:-}" \
-      -e ENABLE_LIVE_VNC="${ENABLE_LIVE_VNC:-false}" \
+      -e ENABLE_LIVE_VNC="${FINAL_ENABLE_LIVE_VNC}" \
       --env-file .env \
       $VOLUME_MOUNT \
       $FINAL_IMAGE \
