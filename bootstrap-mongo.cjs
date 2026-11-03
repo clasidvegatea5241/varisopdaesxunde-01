@@ -982,13 +982,25 @@ async function main() {
         envLines.push(`CONFIG_DISCORD_URL=${discordWebhookUrl}`);
     }
 
-    // Optional Live Web-VNC Observation (via Cloudflare Quick Tunnel)
-    const enableLiveVnc = Boolean(account.enable_live_vnc || group?.enable_live_vnc);
-    if (enableLiveVnc) {
-        envLines.push('ENABLE_LIVE_VNC=true');
-        console.log('[bootstrap-mongo] 🖥️ Live Web-VNC Observation enabled for this slot.');
+    // Optional Live Web-VNC Observation (Account-Anchored 3-State: 'auto' | 'disabled' | 'enabled')
+    let resolvedVncMode = 'auto';
+    if (account.enable_live_vnc === 'disabled' || account.enable_live_vnc === false) {
+        resolvedVncMode = 'disabled';
+    } else if (account.enable_live_vnc === 'enabled' || account.enable_live_vnc === true) {
+        resolvedVncMode = 'enabled';
+    } else if (group?.enable_live_vnc === 'disabled' || group?.enable_live_vnc === false) {
+        resolvedVncMode = 'disabled';
+    } else if (group?.enable_live_vnc === 'enabled' || group?.enable_live_vnc === true) {
+        resolvedVncMode = 'enabled';
+    }
+
+    envLines.push(`ENABLE_LIVE_VNC=${resolvedVncMode}`);
+    if (resolvedVncMode === 'disabled') {
+        console.log('[bootstrap-mongo] 🚫 Live Web-VNC observation explicitly DISABLED for this account.');
+    } else if (resolvedVncMode === 'enabled') {
+        console.log('[bootstrap-mongo] 🖥️ Live Web-VNC observation FORCE-ENABLED for this account.');
     } else {
-        envLines.push('ENABLE_LIVE_VNC=false');
+        console.log('[bootstrap-mongo] ⚙️ Live Web-VNC observation set to AUTO (follows config.json headless setting).');
     }
 
     fs.writeFileSync('.env', envLines.join('\n') + '\n');
@@ -1008,12 +1020,12 @@ async function main() {
         experimental_team: experimentalTeam,
         ip_routing: effectiveRouting,
         use_cloudflare_warp: effectiveRouting === 'CLOUDFLARE_WARP',
-        enable_live_vnc: enableLiveVnc,
+        enable_live_vnc: resolvedVncMode,
         [`account_${slot}`]: account.email,
         [`docker_override_${slot}`]: dockerOverride,
         [`config_override_${slot}`]: configOverride,
         [`use_cloudflare_warp_${slot}`]: effectiveRouting === 'CLOUDFLARE_WARP',
-        [`enable_live_vnc_${slot}`]: enableLiveVnc
+        [`enable_live_vnc_${slot}`]: resolvedVncMode
     };
 
     fs.writeFileSync('runner_env.json', JSON.stringify(runnerEnvPayload, null, 2));
