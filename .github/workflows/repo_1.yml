@@ -139,6 +139,10 @@ jobs:
                  echo "CONFIG_DISCORD_ENABLED=true" >> .env
                  echo "CONFIG_DISCORD_URL=$DW_URL" >> .env
               fi
+              VNC_VAL=$(jq -r '.enable_live_vnc_1 // .enable_live_vnc // "auto"' runner_env.json)
+              if [ "$VNC_VAL" != "null" ] && [ -n "$VNC_VAL" ]; then
+                 echo "ENABLE_LIVE_VNC=$VNC_VAL" >> .env
+              fi
 
               echo "========================================="
               echo "  Currently loading data for SLOT 1"
