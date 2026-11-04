@@ -134,102 +134,342 @@ if [ "$SLOT" = "7" ] || [ "$SLOT" = "8" ] || [ "$SLOT" = "9" ]; then
 fi
 
 # =========================================================
-# Execution Gate: Region Guard (US IP Verification)
+# Execution Gate: Unified Pre-Flight Region & IP Shield
+# (Supports Direct Connection, Cloudflare WARP, and Custom Proxy)
 # =========================================================
+
+# 1. Resolve Group & Slot Metadata
+GROUP_NAME="${GROUP_ID:-}"
+if [ -z "$GROUP_NAME" ] && [ -f runner_env.json ]; then
+    GROUP_NAME=$(jq -r '.group_id // .group // empty' runner_env.json 2>/dev/null || echo "")
+fi
+[ -z "$GROUP_NAME" ] && GROUP_NAME="Unknown"
+
+# 2. Autonomous Auto-Reroll & Human-like Delay Logic (Unified Engine)
+trigger_autonomous_reroll() {
+    local GUARD_TYPE="$1"
+    local TITLE="$2"
+    local REASON_SUMMARY="$3"
+    local EMBED_COLOR="$4"
+    local DETAIL_LABEL="$5"
+    local DETAIL_VALUE="$6"
+
+    RETRY_ATTEMPT="${RETRY_ATTEMPT:-0}"
+    if ! [[ "$RETRY_ATTEMPT" =~ ^[0-9]+$ ]]; then
+        RETRY_ATTEMPT=0
+    fi
+
+    PAT_TOKEN="${GH_PAT:-${AUTO_RERUN_TOKEN:-}}"
+    MAX_RETRIES=3
+    AUTO_REROLL_TRIGGERED=false
+    BUFFER_DELAY=0
+
+    # Determine target workflow file name
+    TARGET_WORKFLOW="${WORKFLOW_FILE:-}"
+    if [ -z "$TARGET_WORKFLOW" ] && [ -n "$GITHUB_WORKFLOW_REF" ]; then
+        TARGET_WORKFLOW=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+    fi
+
+    if [ -n "$PAT_TOKEN" ] && [ "$PAT_TOKEN" != "null" ] && [ "$RETRY_ATTEMPT" -lt "$MAX_RETRIES" ] && [ -n "$TARGET_WORKFLOW" ]; then
+        NEXT_ATTEMPT=$((RETRY_ATTEMPT + 1))
+        BUFFER_DELAY=$((60 + RANDOM % 61)) # 60 to 120 seconds
+
+        echo "=========================================================================="
+        echo "🔄 AUTONOMOUS AUTO-REROLL: Dispatching replacement runner..."
+        echo "   Guard Type:       $GUARD_TYPE"
+        echo "   Target Workflow:  $TARGET_WORKFLOW"
+        echo "   Branch / Ref:     ${GITHUB_REF_NAME:-main}"
+        echo "   Attempt:          $NEXT_ATTEMPT of $MAX_RETRIES"
+        echo "   Human Buffer:     ${BUFFER_DELAY}s (Queued job starts after current job exits)"
+        echo "=========================================================================="
+
+        DISPATCH_SUCCESS=false
+
+        # Method 1: GitHub CLI (if gh binary is present)
+        if command -v gh >/dev/null 2>&1; then
+            if GH_TOKEN="$PAT_TOKEN" gh workflow run "$TARGET_WORKFLOW" \
+                --ref "${GITHUB_REF_NAME:-main}" \
+                -f retry_attempt="$NEXT_ATTEMPT" >/dev/null 2>&1; then
+                DISPATCH_SUCCESS=true
+            fi
+        fi
+
+        # Method 2: Fallback to GitHub REST API via curl
+        if [ "$DISPATCH_SUCCESS" = "false" ] && [ -n "$GITHUB_REPOSITORY" ]; then
+            HTTP_RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                -H "Authorization: Bearer $PAT_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${TARGET_WORKFLOW}/dispatches" \
+                -d "{\"ref\":\"${GITHUB_REF_NAME:-main}\",\"inputs\":{\"retry_attempt\":\"${NEXT_ATTEMPT}\"}}" 2>/dev/null || echo "000")
+            if [ "$HTTP_RESP" = "204" ] || [ "$HTTP_RESP" = "200" ] || [ "$HTTP_RESP" = "201" ]; then
+                DISPATCH_SUCCESS=true
+            fi
+        fi
+
+        if [ "$DISPATCH_SUCCESS" = "true" ]; then
+            AUTO_REROLL_TRIGGERED=true
+            echo "✅ Replacement run successfully queued in GitHub Actions!"
+        else
+            echo "⚠️ Failed to dispatch replacement run via API. Proceeding with standard exit."
+        fi
+    elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
+        echo "=========================================================================="
+        echo "⛔ MAX AUTO-RETRIES REACHED ($RETRY_ATTEMPT/$MAX_RETRIES)!"
+        echo "   Issue persisted across multiple attempts. Manual check required."
+        echo "=========================================================================="
+    fi
+
+    echo "=========================================================================="
+    echo "$TITLE"
+    echo "   Group:            $GROUP_NAME"
+    echo "   Slot:             Slot $SLOT"
+    echo "   Account:          $ACCOUNT_EMAIL"
+    echo "   Country:          $RUNNER_COUNTRY"
+    echo "   Location:         $RUNNER_CITY, $RUNNER_REGION"
+    echo "   Egress IP:        $RUNNER_IP"
+    echo "   ISP / Org:        $RUNNER_ORG"
+    echo "   Network Mode:     $NETWORK_MODE_LABEL"
+    echo "   Reason:           $REASON_SUMMARY"
+    if [ -n "$DETAIL_LABEL" ] && [ -n "$DETAIL_VALUE" ]; then
+        echo "   $DETAIL_LABEL:    $DETAIL_VALUE"
+    fi
+    if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+        echo "   Auto-Reroll:      Queued (Attempt $NEXT_ATTEMPT/$MAX_RETRIES, buffer: ${BUFFER_DELAY}s)"
+    fi
+    echo "--------------------------------------------------------------------------"
+    echo "⛔ Aborting run to protect account: $ACCOUNT_EMAIL"
+    if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+        echo "💡 Replacement run is queued and will execute automatically after cooldown."
+    else
+        echo "💡 TIP: Click 'Re-run failed jobs' on GitHub to acquire a fresh runner."
+    fi
+    echo "=========================================================================="
+
+    if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+        echo "::error title=${GUARD_TYPE} Blocked (Auto-Reroll Queued)::${REASON_SUMMARY}. Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Queued replacement run will launch in ~${BUFFER_DELAY}s (Attempt $NEXT_ATTEMPT/$MAX_RETRIES)."
+    elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
+        echo "::error title=${GUARD_TYPE} Blocked (Max Retries Reached)::${REASON_SUMMARY}. Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Max auto-retries reached ($RETRY_ATTEMPT/$MAX_RETRIES)."
+    else
+        echo "::error title=${GUARD_TYPE} Blocked::${REASON_SUMMARY}. Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL) to protect account."
+    fi
+
+    # Send Discord Webhook Alert if configured
+    DISCORD_URL="${DISCORD_WEBHOOK_URL:-}"
+    if [ -z "$DISCORD_URL" ] && [ -f runner_env.json ]; then
+        DISCORD_URL=$(jq -r '.discord_webhook_url // empty' runner_env.json 2>/dev/null || echo "")
+    fi
+    if [ -z "$DISCORD_URL" ] && [ -f .env ]; then
+        DISCORD_URL=$(grep -E '^CONFIG_DISCORD_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
+    fi
+    if [ -n "$DISCORD_URL" ] && [ "$DISCORD_URL" != "null" ]; then
+        if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+            DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was stopped.\n**Reason:** ${REASON_SUMMARY}\n🔄 **Auto-Reroll Queued!** Fresh runner will start after ~${BUFFER_DELAY}s buffer (Attempt **${NEXT_ATTEMPT}** of ${MAX_RETRIES})."
+            DISCORD_FOOTER="Autonomous Auto-Reroll Active • Queued run executes on fresh VM."
+        elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
+            DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was stopped.\n**Reason:** ${REASON_SUMMARY}\n⛔ **Max Retries Reached (${RETRY_ATTEMPT}/${MAX_RETRIES})!**"
+            DISCORD_FOOTER="Action: Issue persisted across multiple attempts. Manual check required."
+        else
+            DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was stopped to protect the account.\n**Reason:** ${REASON_SUMMARY}"
+            DISCORD_FOOTER="Action: Click Re-run failed jobs on GitHub to acquire a fresh runner."
+        fi
+
+        DISCORD_PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg group "$GROUP_NAME" \
+            --arg email "$ACCOUNT_EMAIL" \
+            --arg slot "$SLOT" \
+            --arg ip "$RUNNER_IP" \
+            --arg country "$RUNNER_COUNTRY" \
+            --arg city "$RUNNER_CITY" \
+            --arg region "$RUNNER_REGION" \
+            --arg mode "$NETWORK_MODE_LABEL" \
+            --arg desc "$DISCORD_DESC" \
+            --arg footer "$DISCORD_FOOTER" \
+            --argjson color "$EMBED_COLOR" \
+            --arg dlabel "$DETAIL_LABEL" \
+            --arg dval "$DETAIL_VALUE" \
+            '{
+                embeds: [{
+                    title: $title,
+                    description: $desc,
+                    color: $color,
+                    fields: ([
+                        { name: "Group", value: $group, inline: true },
+                        { name: "Slot", value: ("Slot " + $slot), inline: true },
+                        { name: "Network Mode", value: $mode, inline: true },
+                        { name: "Country", value: $country, inline: true },
+                        { name: "Location", value: ($city + ", " + $region), inline: true },
+                        { name: "Egress IP", value: $ip, inline: true },
+                        { name: "Account", value: $email, inline: false }
+                    ] + (if ($dlabel != "" and $dval != "") then [{ name: $dlabel, value: $dval, inline: false }] else [] end)),
+                    footer: { text: $footer },
+                    timestamp: (now | todate)
+                }]
+            }' 2>/dev/null || echo "")
+
+        if [ -n "$DISCORD_PAYLOAD" ]; then
+            curl -s -H "Content-Type: application/json" -X POST -d "$DISCORD_PAYLOAD" "$DISCORD_URL" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # Human-like buffer sleep before exiting so the queued job starts naturally
+    if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
+        echo "⏳ Holding human-like buffer of ${BUFFER_DELAY}s before exiting so the queued job starts naturally..."
+        sleep "$BUFFER_DELAY"
+    fi
+
+    exit 1
+}
+
+# 3. Detect Active Network Mode (WARP vs. Dedicated Custom Proxy vs. Direct)
+IS_WARP_MODE=false
+if [ -f .env ] && grep -q "USE_CLOUDFLARE_WARP=true" .env 2>/dev/null; then
+    IS_WARP_MODE=true
+elif [ -f runner_env.json ] && jq -e ".use_cloudflare_warp_${SLOT} == true or .use_cloudflare_warp == true" runner_env.json >/dev/null 2>&1; then
+    IS_WARP_MODE=true
+fi
+
+IS_CUSTOM_PROXY=false
+FULL_PROXY_URL=""
 ACCOUNT_PROXY_URL=$(grep -E '^ACCOUNT_1_PROXY_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
 ACCOUNT_PROXY_PORT=$(grep -E '^ACCOUNT_1_PROXY_PORT=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
 
 if [ -n "$ACCOUNT_PROXY_URL" ] && [ "$ACCOUNT_PROXY_URL" != "null" ]; then
-    FULL_PROXY_URL="$ACCOUNT_PROXY_URL"
-    if [ -n "$ACCOUNT_PROXY_PORT" ] && [ "$ACCOUNT_PROXY_PORT" != "null" ] && ! echo "$ACCOUNT_PROXY_URL" | grep -qE ':[0-9]+$'; then
-        FULL_PROXY_URL="${ACCOUNT_PROXY_URL}:${ACCOUNT_PROXY_PORT}"
+    # Filter out local SOCKS5 proxy on 127.0.0.1 (which belongs to Cloudflare WARP)
+    if ! echo "$ACCOUNT_PROXY_URL" | grep -qE "127\.0\.0\.1|localhost"; then
+        IS_CUSTOM_PROXY=true
+        FULL_PROXY_URL="$ACCOUNT_PROXY_URL"
+        if [ -n "$ACCOUNT_PROXY_PORT" ] && [ "$ACCOUNT_PROXY_PORT" != "null" ] && ! echo "$ACCOUNT_PROXY_URL" | grep -qE ':[0-9]+$'; then
+            FULL_PROXY_URL="${ACCOUNT_PROXY_URL}:${ACCOUNT_PROXY_PORT}"
+        fi
     fi
+fi
 
-    echo "========================================================="
-    echo " [Region Guard] Account configured with dedicated proxy:"
-    echo "                 URL: $FULL_PROXY_URL"
-    echo "                 Browser traffic will route through proxy."
-    echo "                 Host runner IP check bypassed."
-    echo "========================================================="
-    # Resolve proxy egress IP for telemetry logging
-    PROXY_DATA=$(curl -s -x "$FULL_PROXY_URL" --connect-timeout 4 --max-time 8 https://ipinfo.io/json 2>/dev/null || echo "")
-    if [ -n "$PROXY_DATA" ]; then
-        RUNNER_IP=$(echo "$PROXY_DATA" | jq -r '.ip // empty' 2>/dev/null || echo "")
-        RUNNER_COUNTRY=$(echo "$PROXY_DATA" | jq -r '.country // "US"' 2>/dev/null || echo "US")
-        RUNNER_REGION=$(echo "$PROXY_DATA" | jq -r '.region // "Proxy"' 2>/dev/null || echo "Proxy")
-        RUNNER_CITY=$(echo "$PROXY_DATA" | jq -r '.city // "Proxy"' 2>/dev/null || echo "Proxy")
-        RUNNER_ORG=$(echo "$PROXY_DATA" | jq -r '.org // "Proxy"' 2>/dev/null || echo "Proxy")
-    fi
+# Configure curl arguments for active network mode
+GEO_CURL_ARGS=""
+if [ "$IS_CUSTOM_PROXY" = "true" ]; then
+    GEO_CURL_ARGS="-x $FULL_PROXY_URL"
+    NETWORK_MODE_LABEL="Custom Proxy ($FULL_PROXY_URL)"
+elif [ "$IS_WARP_MODE" = "true" ]; then
+    GEO_CURL_ARGS="--socks5-hostname 127.0.0.1:40000"
+    NETWORK_MODE_LABEL="Cloudflare WARP (SOCKS5 127.0.0.1:40000)"
 else
-    echo "========================================================="
-    echo " [Region Guard] Direct connection detected (No proxy)."
-    echo "                 Verifying host runner IP is located in the US..."
-    echo "========================================================="
+    GEO_CURL_ARGS=""
+    NETWORK_MODE_LABEL="Direct Connection (Host Runner IP)"
+fi
 
-    resolve_runner_geo() {
-        local data=""
-        local ip=""
-        local country=""
-        local region=""
-        local city=""
-        local org=""
+echo "========================================================="
+echo " [Pre-Flight IP Shield] Active Network Mode:"
+echo "                         $NETWORK_MODE_LABEL"
+echo "========================================================="
 
-        # Provider 1: ipinfo.io
-        data=$(curl -s --connect-timeout 4 --max-time 8 https://ipinfo.io/json 2>/dev/null || echo "")
-        if [ -n "$data" ]; then
-            country=$(echo "$data" | jq -r '.country // empty' 2>/dev/null || echo "")
-            if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
-                ip=$(echo "$data" | jq -r '.ip // empty' 2>/dev/null || echo "")
-                region=$(echo "$data" | jq -r '.region // empty' 2>/dev/null || echo "")
-                city=$(echo "$data" | jq -r '.city // empty' 2>/dev/null || echo "")
-                org=$(echo "$data" | jq -r '.org // empty' 2>/dev/null || echo "")
-                echo "$ip|$country|$region|$city|$org"
-                return 0
-            fi
-        fi
+# 4. Multi-Provider Geolocation Resolver
+resolve_active_geo() {
+    local curl_opts="$1"
+    local data=""
+    local ip=""
+    local country=""
+    local region=""
+    local city=""
+    local org=""
 
-        # Provider 2: ip-api.com
-        data=$(curl -s --connect-timeout 4 --max-time 8 http://ip-api.com/json 2>/dev/null || echo "")
-        if [ -n "$data" ]; then
-            country=$(echo "$data" | jq -r '.countryCode // empty' 2>/dev/null || echo "")
-            if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
-                ip=$(echo "$data" | jq -r '.query // empty' 2>/dev/null || echo "")
-                region=$(echo "$data" | jq -r '.regionName // empty' 2>/dev/null || echo "")
-                city=$(echo "$data" | jq -r '.city // empty' 2>/dev/null || echo "")
-                org=$(echo "$data" | jq -r '.isp // empty' 2>/dev/null || echo "")
-                echo "$ip|$country|$region|$city|$org"
-                return 0
-            fi
-        fi
-
-        # Provider 3: ifconfig.co
-        data=$(curl -s --connect-timeout 4 --max-time 8 https://ifconfig.co/json 2>/dev/null || echo "")
-        if [ -n "$data" ]; then
-            country=$(echo "$data" | jq -r '.country_iso // empty' 2>/dev/null || echo "")
-            if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
-                ip=$(echo "$data" | jq -r '.ip // empty' 2>/dev/null || echo "")
-                region=$(echo "$data" | jq -r '.region_name // empty' 2>/dev/null || echo "")
-                city=$(echo "$data" | jq -r '.city // empty' 2>/dev/null || echo "")
-                org=$(echo "$data" | jq -r '.asn_org // empty' 2>/dev/null || echo "")
-                echo "$ip|$country|$region|$city|$org"
-                return 0
-            fi
-        fi
-
-        # Provider 4 (Fallback for country only): ipinfo.io/country
-        country=$(curl -s --connect-timeout 4 --max-time 8 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]' || echo "")
+    # Provider 1: ipinfo.io
+    data=$(curl $curl_opts -s --connect-timeout 4 --max-time 8 https://ipinfo.io/json 2>/dev/null || echo "")
+    if [ -n "$data" ]; then
+        country=$(echo "$data" | jq -r '.country // empty' 2>/dev/null || echo "")
         if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
-            ip=$(curl -s --connect-timeout 4 --max-time 8 https://ifconfig.me 2>/dev/null | tr -d '[:space:]' || echo "Unknown")
-            echo "$ip|$country|Unknown|Unknown|Unknown"
+            ip=$(echo "$data" | jq -r '.ip // empty' 2>/dev/null || echo "")
+            region=$(echo "$data" | jq -r '.region // empty' 2>/dev/null || echo "")
+            city=$(echo "$data" | jq -r '.city // empty' 2>/dev/null || echo "")
+            org=$(echo "$data" | jq -r '.org // empty' 2>/dev/null || echo "")
+            echo "$ip|$country|$region|$city|$org"
             return 0
         fi
+    fi
 
+    # Provider 2: ip-api.com
+    data=$(curl $curl_opts -s --connect-timeout 4 --max-time 8 http://ip-api.com/json 2>/dev/null || echo "")
+    if [ -n "$data" ]; then
+        country=$(echo "$data" | jq -r '.countryCode // empty' 2>/dev/null || echo "")
+        if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
+            ip=$(echo "$data" | jq -r '.query // empty' 2>/dev/null || echo "")
+            region=$(echo "$data" | jq -r '.regionName // empty' 2>/dev/null || echo "")
+            city=$(echo "$data" | jq -r '.city // empty' 2>/dev/null || echo "")
+            org=$(echo "$data" | jq -r '.isp // empty' 2>/dev/null || echo "")
+            echo "$ip|$country|$region|$city|$org"
+            return 0
+        fi
+    fi
+
+    # Provider 3: ifconfig.co
+    data=$(curl $curl_opts -s --connect-timeout 4 --max-time 8 https://ifconfig.co/json 2>/dev/null || echo "")
+    if [ -n "$data" ]; then
+        country=$(echo "$data" | jq -r '.country_iso // empty' 2>/dev/null || echo "")
+        if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
+            ip=$(echo "$data" | jq -r '.ip // empty' 2>/dev/null || echo "")
+            region=$(echo "$data" | jq -r '.region_name // empty' 2>/dev/null || echo "")
+            city=$(echo "$data" | jq -r '.city // empty' 2>/dev/null || echo "")
+            org=$(echo "$data" | jq -r '.asn_org // empty' 2>/dev/null || echo "")
+            echo "$ip|$country|$region|$city|$org"
+            return 0
+        fi
+    fi
+
+    # Provider 4 (Fallback for country only): ipinfo.io/country
+    country=$(curl $curl_opts -s --connect-timeout 4 --max-time 8 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]' || echo "")
+    if [ -n "$country" ] && [ ${#country} -eq 2 ]; then
+        ip=$(curl $curl_opts -s --connect-timeout 4 --max-time 8 https://ifconfig.me 2>/dev/null | tr -d '[:space:]' || echo "Unknown")
+        echo "$ip|$country|Unknown|Unknown|Unknown"
+        return 0
+    fi
+
+    return 1
+}
+
+# 5. In-Flight WARP Reconnect Engine
+rotate_warp_tunnel() {
+    local attempt="$1"
+    local max_attempts=3
+    echo "=========================================================================="
+    echo "🔄 [WARP Shield] Attempting in-flight WARP tunnel rotation (Attempt $attempt of $max_attempts)..."
+    echo "=========================================================================="
+
+    sudo warp-cli --accept-tos disconnect 2>/dev/null || true
+    sleep 2
+    sudo warp-cli --accept-tos connect 2>/dev/null || true
+
+    local healthy=false
+    for i in 1 2 3 4 5; do
+        if curl --socks5-hostname 127.0.0.1:40000 -s --max-time 4 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on"; then
+            healthy=true
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$healthy" = "true" ]; then
+        echo "✅ [WARP Shield] SOCKS5 tunnel active on 127.0.0.1:40000. Re-auditing fresh egress IP..."
+        return 0
+    else
+        echo "⚠️ [WARP Shield] WARP tunnel failed to reconnect."
         return 1
-    }
+    fi
+}
 
+# 6. Unified Pre-Flight Verification Loop
+MAX_WARP_ROTATIONS=3
+[ "$IS_WARP_MODE" != "true" ] && MAX_WARP_ROTATIONS=1
+
+RUNNER_IP=""
+RUNNER_COUNTRY=""
+RUNNER_REGION=""
+RUNNER_CITY=""
+RUNNER_ORG=""
+
+for warp_try in $(seq 1 $MAX_WARP_ROTATIONS); do
     RUNNER_GEO=""
     for attempt in 1 2 3; do
-        RUNNER_GEO=$(resolve_runner_geo || echo "")
+        RUNNER_GEO=$(resolve_active_geo "$GEO_CURL_ARGS" || echo "")
         if [ -n "$RUNNER_GEO" ]; then
             break
         fi
@@ -239,260 +479,86 @@ else
 
     if [ -z "$RUNNER_GEO" ]; then
         echo "=========================================================================="
-        echo "🚨 ERROR: Unable to verify runner IP geolocation after 3 attempts."
-        echo "          Direct-connection mode requires verified US IP for account safety."
+        echo "🚨 ERROR: Unable to verify active IP geolocation after 3 attempts."
+        echo "          Mode: $NETWORK_MODE_LABEL"
         echo "=========================================================================="
-        echo "::error title=Region Guard::Failed to resolve runner IP geolocation after 3 attempts. Aborted for account safety."
+        echo "::error title=Region Guard::Failed to resolve active IP geolocation after 3 attempts. Aborted for account safety."
         exit 1
     fi
 
     IFS="|" read -r RUNNER_IP RUNNER_COUNTRY RUNNER_REGION RUNNER_CITY RUNNER_ORG <<< "$RUNNER_GEO"
 
-    # Resolve Group Name/ID for guards
-    GROUP_NAME="${GROUP_ID:-}"
-    if [ -z "$GROUP_NAME" ] && [ -f runner_env.json ]; then
-        GROUP_NAME=$(jq -r '.group_id // .group // empty' runner_env.json 2>/dev/null || echo "")
-    fi
-    if [ -z "$GROUP_NAME" ]; then
-        GROUP_NAME="Unknown"
-    fi
-
-    # ------------------------------------------------------------------
-    # Autonomous Auto-Reroll & Human-like Delay Logic (Unified Engine)
-    # ------------------------------------------------------------------
-    trigger_autonomous_reroll() {
-        local GUARD_TYPE="$1"
-        local TITLE="$2"
-        local REASON_SUMMARY="$3"
-        local EMBED_COLOR="$4"
-        local DETAIL_LABEL="$5"
-        local DETAIL_VALUE="$6"
-
-        RETRY_ATTEMPT="${RETRY_ATTEMPT:-0}"
-        if ! [[ "$RETRY_ATTEMPT" =~ ^[0-9]+$ ]]; then
-            RETRY_ATTEMPT=0
-        fi
-
-        PAT_TOKEN="${GH_PAT:-${AUTO_RERUN_TOKEN:-}}"
-        MAX_RETRIES=3
-        AUTO_REROLL_TRIGGERED=false
-        BUFFER_DELAY=0
-
-        # Determine target workflow file name
-        TARGET_WORKFLOW="${WORKFLOW_FILE:-}"
-        if [ -z "$TARGET_WORKFLOW" ] && [ -n "$GITHUB_WORKFLOW_REF" ]; then
-            TARGET_WORKFLOW=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
-        fi
-
-        if [ -n "$PAT_TOKEN" ] && [ "$PAT_TOKEN" != "null" ] && [ "$RETRY_ATTEMPT" -lt "$MAX_RETRIES" ] && [ -n "$TARGET_WORKFLOW" ]; then
-            NEXT_ATTEMPT=$((RETRY_ATTEMPT + 1))
-            BUFFER_DELAY=$((60 + RANDOM % 61)) # 60 to 120 seconds
-
-            echo "=========================================================================="
-            echo "🔄 AUTONOMOUS AUTO-REROLL: Dispatching replacement runner..."
-            echo "   Guard Type:       $GUARD_TYPE"
-            echo "   Target Workflow:  $TARGET_WORKFLOW"
-            echo "   Branch / Ref:     ${GITHUB_REF_NAME:-main}"
-            echo "   Attempt:          $NEXT_ATTEMPT of $MAX_RETRIES"
-            echo "   Human Buffer:     ${BUFFER_DELAY}s (Queued job starts after current job exits)"
-            echo "=========================================================================="
-
-            DISPATCH_SUCCESS=false
-
-            # Method 1: GitHub CLI (if gh binary is present)
-            if command -v gh >/dev/null 2>&1; then
-                if GH_TOKEN="$PAT_TOKEN" gh workflow run "$TARGET_WORKFLOW" \
-                    --ref "${GITHUB_REF_NAME:-main}" \
-                    -f retry_attempt="$NEXT_ATTEMPT" >/dev/null 2>&1; then
-                    DISPATCH_SUCCESS=true
-                fi
-            fi
-
-            # Method 2: Fallback to GitHub REST API via curl
-            if [ "$DISPATCH_SUCCESS" = "false" ] && [ -n "$GITHUB_REPOSITORY" ]; then
-                HTTP_RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-                    -H "Authorization: Bearer $PAT_TOKEN" \
-                    -H "Accept: application/vnd.github+json" \
-                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${TARGET_WORKFLOW}/dispatches" \
-                    -d "{\"ref\":\"${GITHUB_REF_NAME:-main}\",\"inputs\":{\"retry_attempt\":\"${NEXT_ATTEMPT}\"}}" 2>/dev/null || echo "000")
-                if [ "$HTTP_RESP" = "204" ] || [ "$HTTP_RESP" = "200" ] || [ "$HTTP_RESP" = "201" ]; then
-                    DISPATCH_SUCCESS=true
-                fi
-            fi
-
-            if [ "$DISPATCH_SUCCESS" = "true" ]; then
-                AUTO_REROLL_TRIGGERED=true
-                echo "✅ Replacement run successfully queued in GitHub Actions!"
-            else
-                echo "⚠️ Failed to dispatch replacement run via API. Proceeding with standard exit."
-            fi
-        elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
-            echo "=========================================================================="
-            echo "⛔ MAX AUTO-RETRIES REACHED ($RETRY_ATTEMPT/$MAX_RETRIES)!"
-            echo "   Issue persisted across multiple attempts. Manual check required."
-            echo "=========================================================================="
-        fi
-
-        echo "=========================================================================="
-        echo "$TITLE"
-        echo "   Group:            $GROUP_NAME"
-        echo "   Slot:             Slot $SLOT"
-        echo "   Account:          $ACCOUNT_EMAIL"
-        echo "   Country:          $RUNNER_COUNTRY"
-        echo "   Location:         $RUNNER_CITY, $RUNNER_REGION"
-        echo "   Runner Public IP: $RUNNER_IP"
-        echo "   ISP / Org:        $RUNNER_ORG"
-        echo "   Reason:           $REASON_SUMMARY"
-        if [ -n "$DETAIL_LABEL" ] && [ -n "$DETAIL_VALUE" ]; then
-            echo "   $DETAIL_LABEL:    $DETAIL_VALUE"
-        fi
-        if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
-            echo "   Auto-Reroll:      Queued (Attempt $NEXT_ATTEMPT/$MAX_RETRIES, buffer: ${BUFFER_DELAY}s)"
-        fi
-        echo "--------------------------------------------------------------------------"
-        echo "⛔ Aborting run to protect account: $ACCOUNT_EMAIL"
-        if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
-            echo "💡 Replacement run is queued and will execute automatically after cooldown."
-        else
-            echo "💡 TIP: Click 'Re-run failed jobs' on GitHub to acquire a fresh runner."
-        fi
-        echo "=========================================================================="
-
-        if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
-            echo "::error title=${GUARD_TYPE} Blocked (Auto-Reroll Queued)::${REASON_SUMMARY}. Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Queued replacement run will launch in ~${BUFFER_DELAY}s (Attempt $NEXT_ATTEMPT/$MAX_RETRIES)."
-        elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
-            echo "::error title=${GUARD_TYPE} Blocked (Max Retries Reached)::${REASON_SUMMARY}. Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL). Max auto-retries reached ($RETRY_ATTEMPT/$MAX_RETRIES)."
-        else
-            echo "::error title=${GUARD_TYPE} Blocked::${REASON_SUMMARY}. Stopped Group $GROUP_NAME Slot $SLOT ($ACCOUNT_EMAIL) to protect account."
-        fi
-
-        # Send Discord Webhook Alert if configured (Supports Secrets, Matrix DB runner_env.json, and .env)
-        DISCORD_URL="${DISCORD_WEBHOOK_URL:-}"
-        if [ -z "$DISCORD_URL" ] && [ -f runner_env.json ]; then
-            DISCORD_URL=$(jq -r '.discord_webhook_url // empty' runner_env.json 2>/dev/null || echo "")
-        fi
-        if [ -z "$DISCORD_URL" ] && [ -f .env ]; then
-            DISCORD_URL=$(grep -E '^CONFIG_DISCORD_URL=' .env 2>/dev/null | cut -d '=' -f2- | tr -d '[:space:]' || echo "")
-        fi
-        if [ -n "$DISCORD_URL" ] && [ "$DISCORD_URL" != "null" ]; then
-            if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
-                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was stopped.\n**Reason:** ${REASON_SUMMARY}\n🔄 **Auto-Reroll Queued!** Fresh runner will start after ~${BUFFER_DELAY}s buffer (Attempt **${NEXT_ATTEMPT}** of ${MAX_RETRIES})."
-                DISCORD_FOOTER="Autonomous Auto-Reroll Active • Queued run executes on fresh VM."
-            elif [ "$RETRY_ATTEMPT" -ge "$MAX_RETRIES" ]; then
-                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was stopped.\n**Reason:** ${REASON_SUMMARY}\n⛔ **Max Retries Reached (${RETRY_ATTEMPT}/${MAX_RETRIES})!**"
-                DISCORD_FOOTER="Action: Issue persisted across multiple attempts. Manual check required."
-            else
-                DISCORD_DESC="Group **${GROUP_NAME}** • Slot **${SLOT}** (${ACCOUNT_EMAIL}) was stopped to protect the account.\n**Reason:** ${REASON_SUMMARY}"
-                DISCORD_FOOTER="Action: Click Re-run failed jobs on GitHub to acquire a fresh runner."
-            fi
-
-            DISCORD_PAYLOAD=$(jq -n \
-                --arg title "$TITLE" \
-                --arg group "$GROUP_NAME" \
-                --arg email "$ACCOUNT_EMAIL" \
-                --arg slot "$SLOT" \
-                --arg ip "$RUNNER_IP" \
-                --arg country "$RUNNER_COUNTRY" \
-                --arg city "$RUNNER_CITY" \
-                --arg region "$RUNNER_REGION" \
-                --arg desc "$DISCORD_DESC" \
-                --arg footer "$DISCORD_FOOTER" \
-                --argjson color "$EMBED_COLOR" \
-                --arg dlabel "$DETAIL_LABEL" \
-                --arg dval "$DETAIL_VALUE" \
-                '{
-                    embeds: [{
-                        title: $title,
-                        description: $desc,
-                        color: $color,
-                        fields: ([
-                            { name: "Group", value: $group, inline: true },
-                            { name: "Slot", value: ("Slot " + $slot), inline: true },
-                            { name: "Country", value: $country, inline: true },
-                            { name: "Location", value: ($city + ", " + $region), inline: true },
-                            { name: "Runner IP", value: $ip, inline: true },
-                            { name: "Account", value: $email, inline: false }
-                        ] + (if ($dlabel != "" and $dval != "") then [{ name: $dlabel, value: $dval, inline: false }] else [] end)),
-                        footer: { text: $footer },
-                        timestamp: (now | todate)
-                    }]
-                }' 2>/dev/null || echo "")
-
-            if [ -n "$DISCORD_PAYLOAD" ]; then
-                curl -s -H "Content-Type: application/json" -X POST -d "$DISCORD_PAYLOAD" "$DISCORD_URL" >/dev/null 2>&1 || true
-            fi
-        fi
-
-        # Human-like buffer sleep before exiting so the queued job starts naturally
-        if [ "$AUTO_REROLL_TRIGGERED" = "true" ]; then
-            echo "⏳ Holding human-like buffer of ${BUFFER_DELAY}s before exiting so the queued job starts naturally..."
-            sleep "$BUFFER_DELAY"
-        fi
-
-        exit 1
-    }
-
-    # -------------------------------------------------------------
-    # 1. Non-US Foreign IP Region Guard
-    # -------------------------------------------------------------
+    # Region Guard: US Egress Verification
     if [ "$RUNNER_COUNTRY" != "US" ]; then
+        if [ "$IS_WARP_MODE" = "true" ] && [ "$warp_try" -lt "$MAX_WARP_ROTATIONS" ]; then
+            echo "⚠️ [Region Guard] Non-US WARP egress detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION)."
+            rotate_warp_tunnel "$warp_try"
+            continue
+        fi
         trigger_autonomous_reroll \
             "Region Guard" \
-            "🚨 REGION GUARD: NON-US RUNNER DETECTED!" \
-            "Non-US runner IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION)" \
+            "🚨 REGION GUARD: NON-US EGRESS IP DETECTED!" \
+            "Non-US egress IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION) via $NETWORK_MODE_LABEL" \
             16711680 \
             "Foreign Location" \
             "$RUNNER_CITY, $RUNNER_REGION ($RUNNER_COUNTRY)"
     fi
 
-    echo "✅ [Region Guard] Verified US runner: $RUNNER_IP ($RUNNER_CITY, $RUNNER_REGION - $RUNNER_ORG)."
-fi
+    echo "✅ [Region Guard] Verified US egress: $RUNNER_IP ($RUNNER_CITY, $RUNNER_REGION - $RUNNER_ORG)."
 
-# =========================================================
-# Pre-Flight IP Collision & Frequency Shield
-# =========================================================
-if [ -n "$RUNNER_IP" ] && [ "$RUNNER_IP" != "null" ] && [ -f verify-ip-guard.cjs ]; then
-    echo "🛡️ [IP Collision Shield] Auditing IP collision & frequency gates in MongoDB Atlas..."
-    IP_GUARD_RAW=$(node verify-ip-guard.cjs "$RUNNER_IP" "$RUNNER_COUNTRY" "$RUNNER_REGION" "$RUNNER_CITY" "$RUNNER_ORG" "$SLOT" 2>&1)
-    IP_GUARD_EXIT=$?
+    # Pre-Flight IP Collision & Frequency Shield (MongoDB Atlas)
+    if [ -n "$RUNNER_IP" ] && [ "$RUNNER_IP" != "null" ] && [ -f verify-ip-guard.cjs ]; then
+        echo "🛡️ [IP Collision Shield] Auditing IP collision & frequency gates in MongoDB Atlas..."
+        IP_GUARD_RAW=$(node verify-ip-guard.cjs "$RUNNER_IP" "$RUNNER_COUNTRY" "$RUNNER_REGION" "$RUNNER_CITY" "$RUNNER_ORG" "$SLOT" 2>&1)
+        IP_GUARD_EXIT=$?
 
-    IP_GUARD_JSON=$(echo "$IP_GUARD_RAW" | grep -E '^\{.*\}$' | tail -n 1 || echo "")
-    IP_STATUS=$(echo "$IP_GUARD_JSON" | jq -r '.status // empty' 2>/dev/null || echo "")
+        IP_GUARD_JSON=$(echo "$IP_GUARD_RAW" | grep -E '^\{.*\}$' | tail -n 1 || echo "")
+        IP_STATUS=$(echo "$IP_GUARD_JSON" | jq -r '.status // empty' 2>/dev/null || echo "")
 
-    if [ "$IP_GUARD_EXIT" -eq 2 ] || [ "$IP_STATUS" = "BLOCKED" ]; then
-        GATE=$(echo "$IP_GUARD_JSON" | jq -r '.gate // "COOLDOWN"' 2>/dev/null || echo "COOLDOWN")
-        REASON=$(echo "$IP_GUARD_JSON" | jq -r '.reason // "IP collision detected"' 2>/dev/null || echo "IP collision detected")
-        DETAIL_STR=$(echo "$IP_GUARD_JSON" | jq -r '.detail_str // empty' 2>/dev/null || echo "")
+        if [ "$IP_GUARD_EXIT" -eq 2 ] || [ "$IP_STATUS" = "BLOCKED" ]; then
+            GATE=$(echo "$IP_GUARD_JSON" | jq -r '.gate // "COOLDOWN"' 2>/dev/null || echo "COOLDOWN")
+            REASON=$(echo "$IP_GUARD_JSON" | jq -r '.reason // "IP collision detected"' 2>/dev/null || echo "IP collision detected")
+            DETAIL_STR=$(echo "$IP_GUARD_JSON" | jq -r '.detail_str // empty' 2>/dev/null || echo "")
 
-        if [ "$GATE" = "DAILY_CAP" ]; then
-            trigger_autonomous_reroll \
-                "IP Frequency Guard" \
-                "🛡️ PRE-FLIGHT GUARD: DAILY IP CAP REACHED!" \
-                "$REASON" \
-                15105570 \
-                "Daily Cap Status" \
-                "$DETAIL_STR"
+            if [ "$IS_WARP_MODE" = "true" ] && [ "$warp_try" -lt "$MAX_WARP_ROTATIONS" ]; then
+                echo "⚠️ [IP Collision Shield] Blocked ($GATE: $REASON) on WARP IP: $RUNNER_IP."
+                rotate_warp_tunnel "$warp_try"
+                continue
+            fi
+
+            if [ "$GATE" = "DAILY_CAP" ]; then
+                trigger_autonomous_reroll \
+                    "IP Frequency Guard" \
+                    "🛡️ PRE-FLIGHT GUARD: DAILY IP CAP REACHED!" \
+                    "$REASON" \
+                    15105570 \
+                    "Daily Cap Status" \
+                    "$DETAIL_STR"
+            else
+                trigger_autonomous_reroll \
+                    "IP Collision Guard" \
+                    "🛡️ PRE-FLIGHT GUARD: IP COLLISION AVOIDED!" \
+                    "$REASON" \
+                    15105570 \
+                    "Collision Detail" \
+                    "$DETAIL_STR"
+            fi
         else
-            trigger_autonomous_reroll \
-                "IP Collision Guard" \
-                "🛡️ PRE-FLIGHT GUARD: IP COLLISION AVOIDED!" \
-                "$REASON" \
-                15105570 \
-                "Collision Detail" \
-                "$DETAIL_STR"
+            PASS_MSG=$(echo "$IP_GUARD_JSON" | jq -r '.message // empty' 2>/dev/null || echo "")
+            if [ -n "$PASS_MSG" ]; then
+                echo "✅ [IP Collision Shield] $PASS_MSG"
+            else
+                echo "✅ [IP Collision Shield] Egress IP verified clean ($RUNNER_IP)."
+            fi
         fi
-    else
-        PASS_MSG=$(echo "$IP_GUARD_JSON" | jq -r '.message // empty' 2>/dev/null || echo "")
-        if [ -n "$PASS_MSG" ]; then
-            echo "✅ [IP Collision Shield] $PASS_MSG"
-        else
-            echo "✅ [IP Collision Shield] Runner IP verified clean."
-        fi
+    elif [ -n "$RUNNER_IP" ] && [ "$RUNNER_IP" != "null" ] && [ -f log-ip-mongo.cjs ]; then
+        echo "📡 [IP Telemetry] Recording active egress IP to MongoDB..."
+        node log-ip-mongo.cjs "$RUNNER_IP" "$RUNNER_COUNTRY" "$RUNNER_REGION" "$RUNNER_CITY" "$RUNNER_ORG" "$SLOT" || echo "[-] IP logging warning (non-fatal)."
     fi
-elif [ -n "$RUNNER_IP" ] && [ "$RUNNER_IP" != "null" ] && [ -f log-ip-mongo.cjs ]; then
-    echo "📡 [IP Telemetry] Recording runner IP intelligence to MongoDB..."
-    node log-ip-mongo.cjs "$RUNNER_IP" "$RUNNER_COUNTRY" "$RUNNER_REGION" "$RUNNER_CITY" "$RUNNER_ORG" "$SLOT" || echo "[-] IP logging warning (non-fatal)."
-fi
+
+    # Verified and passed!
+    break
+done
 
 # Common function to run container (defined FIRST)
 run_container() {
