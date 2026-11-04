@@ -527,9 +527,9 @@ run_container() {
     fi
 
     # 1. Inspect active config.json for headless preference
-    CONFIG_HEADLESS_VAL="true"
+    CONFIG_HEADLESS_VAL=""
     if [ -f config/config.json ]; then
-        CONFIG_HEADLESS_VAL=$(jq -r 'if .headless != null then .headless else "true" end' config/config.json 2>/dev/null || echo "true")
+        CONFIG_HEADLESS_VAL=$(jq -r 'if .headless != null then .headless else empty end' config/config.json 2>/dev/null || echo "")
     fi
 
     # 2. Extract account-anchored VNC preference from .env or runner_env.json
@@ -543,9 +543,9 @@ run_container() {
     [ -z "$RAW_VNC_PREF" ] && RAW_VNC_PREF="auto"
 
     # 3. Resolve final VNC state
-    FINAL_ENABLE_LIVE_VNC="false"
+    FINAL_ENABLE_LIVE_VNC="auto"
     if [ "$RAW_VNC_PREF" = "disabled" ] || [ "$RAW_VNC_PREF" = "false" ]; then
-        FINAL_ENABLE_LIVE_VNC="false"
+        FINAL_ENABLE_LIVE_VNC="disabled"
         if [ "$CONFIG_HEADLESS_VAL" = "false" ]; then
             echo "[run.sh] 🚫 Live Web-VNC is explicitly DISABLED for this account."
             echo "[run.sh] 🖥️ Running in Pure Virtual Headed Mode (XVFB) without VNC tunnel (like v4)."
@@ -555,18 +555,23 @@ run_container() {
     elif [ "$RAW_VNC_PREF" = "enabled" ] || [ "$RAW_VNC_PREF" = "true" ]; then
         FINAL_ENABLE_LIVE_VNC="true"
         echo "[run.sh] 📺 On-Demand Live Web-VNC Observation is FORCED ENABLED for this account."
+        sed -i '/^CONFIG_HEADLESS=/d' .env 2>/dev/null || true
+        echo "CONFIG_HEADLESS=false" >> .env
     else
         # 'auto' mode: Follow config.json headless setting
         if [ "$CONFIG_HEADLESS_VAL" = "false" ]; then
             FINAL_ENABLE_LIVE_VNC="true"
             echo "[run.sh] 🖥️ 'headless: false' detected in config.json + auto VNC mode -> Live Web-VNC enabled."
-        else
+        elif [ "$CONFIG_HEADLESS_VAL" = "true" ]; then
             FINAL_ENABLE_LIVE_VNC="false"
             echo "[run.sh] 🕶️ 'headless: true' detected in config.json -> Standard Headless Mode active."
+        else
+            FINAL_ENABLE_LIVE_VNC="auto"
+            echo "[run.sh] ⚙️ Live Web-VNC set to AUTO (will follow container internal headless setting)."
         fi
     fi
 
-    # Sync into .env so container receives clean boolean
+    # Sync into .env so container receives clean variable
     sed -i '/^ENABLE_LIVE_VNC=/d' .env 2>/dev/null || true
     echo "ENABLE_LIVE_VNC=${FINAL_ENABLE_LIVE_VNC}" >> .env
 
