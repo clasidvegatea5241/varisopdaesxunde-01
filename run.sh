@@ -456,7 +456,66 @@ rotate_warp_tunnel() {
     fi
 }
 
-# 6. Unified Pre-Flight Verification Loop
+# 6. Two-Tier Pre-Flight Verification Engine
+
+# ==============================================================================
+# Tier 1: Host-Level Region Guard (Direct GitHub Actions Runner VM Audit)
+# Audits physical datacenter location for ALL accounts before proxy/WARP steps
+# ==============================================================================
+echo "========================================================="
+echo " [Tier 1 Pre-Flight] Auditing Direct GitHub Host Runner IP..."
+echo "========================================================="
+
+HOST_RUNNER_GEO=""
+for attempt in 1 2 3; do
+    HOST_RUNNER_GEO=$(resolve_active_geo "" || echo "")
+    if [ -n "$HOST_RUNNER_GEO" ]; then
+        break
+    fi
+    echo "[-] Host geolocation lookup attempt $attempt/3 failed. Retrying in 2 seconds..."
+    sleep 2
+done
+
+if [ -z "$HOST_RUNNER_GEO" ]; then
+    echo "=========================================================================="
+    echo "🚨 ERROR: Unable to verify GitHub host runner IP geolocation after 3 attempts."
+    echo "=========================================================================="
+    echo "::error title=Host Region Guard::Failed to resolve GitHub host runner IP geolocation after 3 attempts. Aborted for account safety."
+    exit 1
+fi
+
+IFS="|" read -r HOST_RUNNER_IP HOST_RUNNER_COUNTRY HOST_RUNNER_REGION HOST_RUNNER_CITY HOST_RUNNER_ORG <<< "$HOST_RUNNER_GEO"
+
+# Enforce US-only Physical Runner Datacenter
+if [ "$HOST_RUNNER_COUNTRY" != "US" ]; then
+    echo "=========================================================================="
+    echo "🚨 [Host Region Guard] Foreign GitHub runner detected ($HOST_RUNNER_COUNTRY - $HOST_RUNNER_CITY, $HOST_RUNNER_REGION)."
+    echo "   Aborting run immediately to prevent non-US execution."
+    echo "=========================================================================="
+    RUNNER_IP="$HOST_RUNNER_IP"
+    RUNNER_COUNTRY="$HOST_RUNNER_COUNTRY"
+    RUNNER_CITY="$HOST_RUNNER_CITY"
+    RUNNER_REGION="$HOST_RUNNER_REGION"
+    RUNNER_ORG="$HOST_RUNNER_ORG"
+    trigger_autonomous_reroll \
+        "Host Region Guard" \
+        "🚨 REGION GUARD: NON-US GITHUB RUNNER IP DETECTED!" \
+        "GitHub Actions runner VM is physically located in a foreign datacenter ($HOST_RUNNER_COUNTRY - $HOST_RUNNER_CITY, $HOST_RUNNER_REGION)" \
+        16711680 \
+        "Foreign Host Location" \
+        "$HOST_RUNNER_CITY, $HOST_RUNNER_REGION ($HOST_RUNNER_COUNTRY) [Host IP: $HOST_RUNNER_IP - $HOST_RUNNER_ORG]"
+fi
+
+echo "✅ [Host Region Guard] Verified US GitHub runner: $HOST_RUNNER_IP ($HOST_RUNNER_CITY, $HOST_RUNNER_REGION - $HOST_RUNNER_ORG)."
+
+# ==============================================================================
+# Tier 2: Egress-Level Shield (Cloudflare WARP / Custom Proxy / Direct)
+# ==============================================================================
+echo "========================================================="
+echo " [Tier 2 Pre-Flight] Auditing Active Network Egress IP..."
+echo "                     Mode: $NETWORK_MODE_LABEL"
+echo "========================================================="
+
 MAX_WARP_ROTATIONS=3
 [ "$IS_WARP_MODE" != "true" ] && MAX_WARP_ROTATIONS=1
 
@@ -468,21 +527,26 @@ RUNNER_ORG=""
 
 for warp_try in $(seq 1 $MAX_WARP_ROTATIONS); do
     RUNNER_GEO=""
-    for attempt in 1 2 3; do
-        RUNNER_GEO=$(resolve_active_geo "$GEO_CURL_ARGS" || echo "")
-        if [ -n "$RUNNER_GEO" ]; then
-            break
-        fi
-        echo "[-] Geolocation lookup attempt $attempt/3 failed. Retrying in 2 seconds..."
-        sleep 2
-    done
+    if [ "$IS_WARP_MODE" != "true" ] && [ "$IS_CUSTOM_PROXY" != "true" ]; then
+        # Direct Mode: Re-use verified Tier 1 Host Runner IP without redundant network call
+        RUNNER_GEO="$HOST_RUNNER_GEO"
+    else
+        for attempt in 1 2 3; do
+            RUNNER_GEO=$(resolve_active_geo "$GEO_CURL_ARGS" || echo "")
+            if [ -n "$RUNNER_GEO" ]; then
+                break
+            fi
+            echo "[-] Egress geolocation lookup attempt $attempt/3 failed. Retrying in 2 seconds..."
+            sleep 2
+        done
+    fi
 
     if [ -z "$RUNNER_GEO" ]; then
         echo "=========================================================================="
-        echo "🚨 ERROR: Unable to verify active IP geolocation after 3 attempts."
+        echo "🚨 ERROR: Unable to verify active egress IP geolocation after 3 attempts."
         echo "          Mode: $NETWORK_MODE_LABEL"
         echo "=========================================================================="
-        echo "::error title=Region Guard::Failed to resolve active IP geolocation after 3 attempts. Aborted for account safety."
+        echo "::error title=Region Guard::Failed to resolve active egress IP geolocation after 3 attempts. Aborted for account safety."
         exit 1
     fi
 
@@ -495,16 +559,19 @@ for warp_try in $(seq 1 $MAX_WARP_ROTATIONS); do
             rotate_warp_tunnel "$warp_try"
             continue
         fi
+        GUARD_TITLE="🚨 REGION GUARD: NON-US EGRESS IP DETECTED!"
+        [ "$IS_WARP_MODE" = "true" ] && GUARD_TITLE="🚨 REGION GUARD: NON-US WARP EGRESS IP DETECTED!"
+        [ "$IS_CUSTOM_PROXY" = "true" ] && GUARD_TITLE="🚨 REGION GUARD: NON-US PROXY EGRESS IP DETECTED!"
         trigger_autonomous_reroll \
-            "Region Guard" \
-            "🚨 REGION GUARD: NON-US EGRESS IP DETECTED!" \
+            "Egress Region Guard" \
+            "$GUARD_TITLE" \
             "Non-US egress IP detected ($RUNNER_COUNTRY - $RUNNER_CITY, $RUNNER_REGION) via $NETWORK_MODE_LABEL" \
             16711680 \
             "Foreign Location" \
             "$RUNNER_CITY, $RUNNER_REGION ($RUNNER_COUNTRY)"
     fi
 
-    echo "✅ [Region Guard] Verified US egress: $RUNNER_IP ($RUNNER_CITY, $RUNNER_REGION - $RUNNER_ORG)."
+    echo "✅ [Egress Guard] Verified US egress: $RUNNER_IP ($RUNNER_CITY, $RUNNER_REGION - $RUNNER_ORG)."
 
     # Pre-Flight IP Collision & Frequency Shield (MongoDB Atlas)
     if [ -n "$RUNNER_IP" ] && [ "$RUNNER_IP" != "null" ] && [ -f verify-ip-guard.cjs ]; then
